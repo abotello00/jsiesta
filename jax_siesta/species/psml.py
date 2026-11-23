@@ -1053,3 +1053,29 @@ def build_sparse_pattern(
         transpose_edge_idx=jnp.asarray(transpose_idx, dtype=jnp.int32),
         symmetry_closed=symmetry_closed,
     )
+
+
+def same_edges(a: SparsePattern, b: SparsePattern) -> bool:
+    r"""True if two sparse patterns have the same edges.
+
+    Theory:
+        Two patterns with the same orbital pairs :math:`(\mu, \nu)` and the same cell shifts index sparse matrices
+        identically, so a matrix on one is valid on the other (the edge vectors may differ).
+
+    Algorithm:
+        Compares the edge count, the cell-shift list and the ``src_orb``, ``dst_unit_orb`` and ``edge_cell_idx`` arrays.
+
+    Invariants:
+        Symmetric and reflexive.
+
+    SIESTA Mapping:
+        No SIESTA equivalent (SIESTA rebuilds its sparse pattern for every run).
+    """
+    return (
+        a.n_edges == b.n_edges
+        and np.array_equal(np.asarray(a.cell_shifts), np.asarray(b.cell_shifts))
+        and np.array_equal(np.asarray(a.src_orb), np.asarray(b.src_orb))
+        and np.array_equal(np.asarray(a.dst_unit_orb), np.asarray(b.dst_unit_orb))
+        and np.array_equal(np.asarray(a.edge_cell_idx), np.asarray(b.edge_cell_idx))
+    )
+

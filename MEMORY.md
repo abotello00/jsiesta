@@ -4,7 +4,7 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-23 (D-046 to D-048 on `perf/fixed-costs`)
+- **Last updated:** 2026-11-24 (D-046 to D-048 on `perf/fixed-costs`, D-049 on `perf/basis-opt`)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
@@ -32,6 +32,8 @@
 - **GPU kernels:** validated against the CPU path (not against SIESTA) — `tests/test_phase3_cuda.py`, 24 of 24 on an A100 with Libxc (job 29610921): orbital–grid kernels and their adjoints on the cached plan (D-036 to D-038), device LDA/GGA XC matching Libxc to 1e-14 (D-039), plans resident, streamed, and streamed without pinning (D-042 to D-044)
 - **Tier B PAO generator:** partially — SZ/DZ/DZP radii and trends vs SIESTA (`test_basis_enthalpy.py`); absolute energies not compared
 - **Basis-enthalpy optimiser:** checked against SIESTA (D-040: same `PAO.Basis` in both codes, Si DZ; line minima within 0.05 Bohr, enthalpy curvatures within 3 %, 28 meV constant offset); pressure unit fixed (was 13.6x too small)
+- **Basis-optimisation speed (D-049):** SiC DZP, 3 structures, per evaluation: 1.86 s on one A100, 5.0 s on 18 CPU
+  threads, SIESTA 23.8 s (same `PAO.Basis`); symmetry set-up and radial tables reused across evaluations and structures
 - **Broyden / ADIIS mixers:** validated against model problems and Co hcp endpoint/trajectory test — `tests/test_mixers.py`, `test_si_bulk_and_co_hcp_spin_modes_and_mixer_endpoint_agreement` (D-022); no external reference exists; ADIIS is slower than Tikhonov-Pulay on all benchmark systems; GR-Pulay not implemented
 - **Harris energy:** validated against an independent recomputation, not against SIESTA — `tests/test_harris.py` (D-023); exact under DM mixing, SIESTA convention (non-variational) under Hamiltonian mixing
 - **Phase 0 matrix parity (H2O, graphene, triclinic Si, C bilayer, Co AFM) with PseudoDojo SR PBE:** validated with per-case tolerances — `test_phase0_matrix_parity_against_siesta` (energies ≤ 5 meV except triclinic Si 52 meV; forces ≤ 3e-4 eV/Å except H2O 0.06 and triclinic Si 0.1; the H2O and triclinic-Si force differences are SIESTA's table error in its neutral-atom pair term, D-025)
@@ -57,6 +59,9 @@
 
 ## Open issues
 
+- **Basis-set export:** `format_pao_basis_block` writes perturbative polarisation shells in a form SIESTA rejects (D-049).
+- **Basis optimisation with symmetry:** each new neighbour set costs the Python symmetry set-up (about 15 s for SiC DZP)
+  and a recompilation; host two-centre integrals are 58 % of a GPU evaluation.
 - **Set-up and compilation cost:** reduced by D-046 (no recompilation per geometry, far fewer first-call
   compilations, opt-in persistent cache), D-047 (threaded host builds) and D-048 (one grid plan per geometry, no
   serial zero fill), measured on the A100: a second Si 512 geometry costs 52.6 s. The sparse pattern is still NumPy

@@ -92,17 +92,18 @@ def run_single_point(
         structure, species_map, include_soc_projectors=(config.nspin == 8)
     )
 
+    k_shift = tuple(case.get("k_shift", (0.0, 0.0, 0.0)))
     sym_proj = None
     if config.use_symmetry:
         from jax_siesta.symmetry.engine import build_native_symmetry
 
         sym_proj, pattern, kmesh, mesh_shape = build_native_symmetry(
-            structure, basis, case["k_grid"], config
+            structure, basis, case["k_grid"], config, k_shifts=k_shift
         )
         two_center = sym_proj.evaluate_irreducible_two_center(structure, basis, pattern, config)
     else:
         pattern = build_sparse_pattern(structure, basis)
-        kmesh = build_monkhorst_pack_mesh(case["k_grid"])
+        kmesh = build_monkhorst_pack_mesh(case["k_grid"], k_shift)
         mesh_shape = choose_mesh_dimensions(
             structure.cell, config.mesh_cutoff_ry, criterion=config.mesh_criterion, mesh_subdivisions=config.mesh_subdivisions
         )

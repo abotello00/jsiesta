@@ -3,7 +3,7 @@ r"""Native space/magnetic-group symmetry engine for grid averaging, irreducible 
 Theory:
     Integrates Steps 1--4 of the native ``spglib`` symmetry architecture:
     1. Space/magnetic group maps, IBZ k-mesh, and commensurate grid permutations ``pi_S``.
-    2. Symmetry-closed CSR sparsity and 16-pt Fibonacci Wigner-D + SU(2) ``segment_sum`` projection.
+    2. Symmetry-closed CSR sparsity and 16-pt Fibonacci Wigner-D + SU(2) sparse projection.
     3. Real-space density and potential symmetrization:
 
        .. math::
@@ -54,6 +54,7 @@ from jax_siesta.integrals.two_center import (
     _pack_pao_tables,
     _setup_c_signatures,
 )
+from jax_siesta.species.psml import build_sparse_pattern, same_edges
 from jax_siesta.symmetry.projection import (
     ProjectionTable,
     _validate_sequential_shells,
@@ -133,7 +134,7 @@ class NativeSymmetryEngine:
             Wigner-D orbital rotations and spinor/collinear transformations.
 
         Algorithm:
-            Dispatches to ``apply_projection_table`` using ``jax.ops.segment_sum``.
+            Dispatches to ``apply_projection_table`` (gather and row sum).
 
         Parameters:
             matrix_edges: Sparse matrix of shape ``(n_spin_mat, n_edges)``.
@@ -664,8 +665,8 @@ def build_native_symmetry(
         Orchestrates Steps 1--2 at geometry startup: extracts Shubnikov/space group,
         reduces the Brillouin zone to the IBZ, chooses symmetry-commensurate FFT mesh
         dimensions, precomputes grid permutations :math:`\pi_S`, closes the sparse pattern,
-        validates 16-pt Fibonacci Wigner-D orthogonality, and compiles the sparse COO
-        projection table for ``jax.ops.segment_sum``.
+        validates 16-pt Fibonacci Wigner-D orthogonality, and compiles the sparse
+        projection table (rows padded to equal length).
 
     Algorithm:
         Executes Steps 1--2 sequentially with zero mutable global state.
@@ -691,6 +692,32 @@ def build_native_symmetry(
     SIESTA Mapping:
         Unified native symmetry setup replacing ``m_symmetry``, ``kpoint_scf``, and ``m_dm_symmetrize``.
     """
+    setup = _structure_symmetry(structure, k_grid, config, k_shifts, symprec, mag_symprec, mesh_shape_override)
+    engine, pattern = _engine_for_basis(structure, basis, setup, config)
+    return engine, pattern, setup.kmesh, setup.mesh_shape
+
+
+@dataclass(frozen=True)
+class _StructureSymmetry:
+    """Symmetry data that depend on the structure and the k/real-space meshes only (not on the basis)."""
+
+    sg: SpaceGroupData
+    kmesh: KPointMesh
+    mesh_shape: tuple[int, int, int]
+    perm_fwd: np.ndarray
+    perm_inv: np.ndarray
+
+
+def _structure_symmetry(
+    structure: Structure,
+    k_grid: tuple[int, int, int],
+    config: SCFConfig,
+    k_shifts: tuple[float, float, float],
+    symprec: float | None,
+    mag_symprec: float | None,
+    mesh_shape_override: tuple[int, int, int] | None,
+) -> _StructureSymmetry:
+    """Space group, IBZ k-mesh, commensurate real-space mesh and its permutations (see ``build_native_symmetry``)."""
     eff_symprec = config.symprec if symprec is None else symprec
     eff_magsym = config.mag_symprec if mag_symprec is None else mag_symprec
     sg = extract_space_group(structure, config, symprec=eff_symprec, mag_symprec=eff_magsym)
@@ -707,13 +734,21 @@ def build_native_symmetry(
             mesh_subdivisions=config.mesh_subdivisions,
         )
     perm_fwd, perm_inv = precompute_grid_permutations(sg, mesh_shape)
-    pattern = build_symmetry_closed_pattern(structure, basis, sg)
+    return _StructureSymmetry(sg=sg, kmesh=kmesh, mesh_shape=mesh_shape, perm_fwd=perm_fwd, perm_inv=perm_inv)
 
-    l_max = max(basis.orb_l) if basis.orb_l else 0
-    for sp in basis.species:
-        if sp.kb_l:
-            l_max = max(l_max, max(sp.kb_l))
 
+def _engine_for_basis(
+    structure: Structure,
+    basis: BasisData,
+    setup: _StructureSymmetry,
+    config: SCFConfig,
+    base_pattern: SparsePattern | None = None,
+) -> tuple[NativeSymmetryEngine, SparsePattern]:
+    """Symmetry-closed pattern, Wigner-D matrices and projection table of ``basis`` (see ``build_native_symmetry``)."""
+    sg = setup.sg
+    pattern = build_symmetry_closed_pattern(structure, basis, sg, base=base_pattern)
+
+    l_max = _basis_l_max(basis)
     wigner_d = compute_wigner_d_matrices(sg.rotations_cart, l_max=l_max, n_fib_pts=16, orth_tol=1e-10)
     proj_table = compile_projection_table(basis, pattern, sg, wigner_d, nspin=config.nspin)
 
@@ -725,17 +760,110 @@ def build_native_symmetry(
         sg=sg,
         basis=basis,
         pattern=pattern,
-        mesh_shape=mesh_shape,
-        perm_fwd=perm_fwd,
-        perm_inv=perm_inv,
+        mesh_shape=setup.mesh_shape,
+        perm_fwd=setup.perm_fwd,
+        perm_inv=setup.perm_inv,
         wigner_d=wigner_d,
         proj_table=proj_table,
         nspin=config.nspin,
-        _perm_inv_jax=jnp.asarray(perm_inv, dtype=jnp.int32),
+        _perm_inv_jax=jnp.asarray(setup.perm_inv, dtype=jnp.int32),
         _rot_cart_jax=jnp.asarray(sg.rotations_cart, dtype=jnp.float64),
         _axial_rot_jax=jnp.asarray(axial_rot, dtype=jnp.float64),
         _trev_sign_jax=jnp.asarray(trev_sign, dtype=jnp.float64),
         _atom_map_jax=jnp.asarray(sg.atom_map, dtype=jnp.int32),
         grid_symmetrization=bool(getattr(config, "symmetrize_grid", True)),
     )
-    return engine, pattern, kmesh, mesh_shape
+    return engine, pattern
+
+
+def _basis_l_max(basis: BasisData) -> int:
+    """Largest angular momentum among the orbitals and KB projectors of ``basis``."""
+    l_max = max(basis.orb_l) if basis.orb_l else 0
+    for sp in basis.species:
+        if sp.kb_l:
+            l_max = max(l_max, max(sp.kb_l))
+    return int(l_max)
+
+
+def _orbital_layout(basis: BasisData) -> tuple[object, ...]:
+    """What the symmetry engine reads from a basis: the orbital ``(atom, l, m, iz)`` layout and the largest ``l``."""
+    return (basis.n_orb, basis.orb_atom, basis.orb_l, basis.orb_m, basis.orb_iz, _basis_l_max(basis))
+
+
+class NativeSymmetrySetupCache:
+    r"""Symmetry set-up of one structure, reused across bases (basis-set optimisation, basis scans).
+
+    Theory:
+        The space group, the irreducible k-mesh and the real-space mesh permutations depend on the structure only. The
+        symmetry-closed pattern and the projection table depend on the basis only through its orbital
+        :math:`(I, l, m, \zeta)` layout and its neighbour set (which orbital pairs overlap), not on the radial shapes.
+
+    Algorithm:
+        Computes the structure part once. For each basis, builds the distance-cutoff pattern (cheap) and returns a
+        cached engine unchanged when the orbital layout and that pattern equal those of one of the last ``max_entries``
+        bases (an optimiser moves back and forth between a few neighbour sets); otherwise closes the pattern and
+        compiles a new projection table. Returning the same engine object also keeps the compiled SCF functions, which
+        take the engine as a static argument by identity.
+
+    Invariants:
+        - ``build(basis)`` returns what ``build_native_symmetry`` returns for the same inputs.
+        - A reused engine's ``basis`` field is the first basis of its layout; the engine reads only the orbital layout
+          from it, and every radial quantity is passed explicitly (``evaluate_irreducible_two_center``).
+
+    SIESTA Mapping:
+        No SIESTA equivalent (SIESTA's basis optimisation reruns the whole program for every candidate basis).
+    """
+
+    def __init__(
+        self,
+        structure: Structure,
+        k_grid: tuple[int, int, int],
+        config: SCFConfig,
+        k_shifts: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        symprec: float | None = None,
+        mag_symprec: float | None = None,
+        mesh_shape_override: tuple[int, int, int] | None = None,
+        max_entries: int = 8,
+    ) -> None:
+        self.structure = structure
+        self.max_entries = max(1, int(max_entries))
+        self.config = config
+        self._setup = _structure_symmetry(structure, k_grid, config, k_shifts, symprec, mag_symprec, mesh_shape_override)
+        self._entries: list[tuple[tuple[object, ...], SparsePattern, NativeSymmetryEngine, SparsePattern]] = []
+        self.n_builds = 0
+        self.n_reuses = 0
+
+    def build(self, basis: BasisData) -> tuple[NativeSymmetryEngine, SparsePattern, KPointMesh, tuple[int, int, int]]:
+        r"""Return ``(engine, pattern, ibz_kmesh, mesh_shape)`` for ``basis``, as ``build_native_symmetry`` does.
+
+        Theory:
+            The engine depends on the basis only through its orbital layout and its distance-cutoff pattern.
+
+        Algorithm:
+            Builds the distance-cutoff pattern of ``basis``; returns a cached engine with the same layout and pattern
+            (moved to the front of the cache), or builds one and caches it, dropping the oldest beyond ``max_entries``.
+
+        Parameters:
+            basis: ``BasisData`` on the cached structure.
+
+        Returns:
+            Tuple ``(engine, pattern, ibz_kmesh, mesh_shape)``.
+
+        Invariants:
+            ``n_builds + n_reuses`` counts the calls.
+
+        SIESTA Mapping:
+            No SIESTA equivalent (see the class).
+        """
+        base = build_sparse_pattern(self.structure, basis)
+        layout = _orbital_layout(basis)
+        for i, entry in enumerate(self._entries):
+            if entry[0] == layout and same_edges(entry[1], base):
+                self.n_reuses += 1
+                self._entries.insert(0, self._entries.pop(i))
+                return entry[2], entry[3], self._setup.kmesh, self._setup.mesh_shape
+        self.n_builds += 1
+        engine, pattern = _engine_for_basis(self.structure, basis, self._setup, self.config, base_pattern=base)
+        self._entries.insert(0, (layout, base, engine, pattern))
+        del self._entries[self.max_entries :]
+        return engine, pattern, self._setup.kmesh, self._setup.mesh_shape

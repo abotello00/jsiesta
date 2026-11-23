@@ -38,14 +38,8 @@ from jax_siesta.core.ffi import load_ffi_library
 from jax_siesta.core.types import BasisData, SCFConfig, SparsePattern, Structure, TwoCenterMatrices
 
 
-def _radial_ft(r: np.ndarray, f: np.ndarray, k: np.ndarray) -> np.ndarray:
-    """3D Fourier transform ``4 pi int r^2 f(r) j0(k r) dr`` of a spherical function."""
-    kr = np.outer(k, r)
-    j0 = np.where(kr > 1e-12, np.sin(kr) / np.where(kr > 1e-12, kr, 1.0), 1.0)
-    return 4.0 * np.pi * np.trapezoid(j0 * (r**2 * f)[None, :], r, axis=1)
-
-
 _W_CACHE: dict[tuple[str, ...], Any] = {}
+_W_CACHE_MAX = 64  # a basis optimisation makes a new pair of radial functions at every evaluation
 
 
 def neutral_atom_density_two_center(species_v: Any, species_n: Any) -> tuple[Any, float]:
@@ -59,8 +53,9 @@ def neutral_atom_density_two_center(species_v: Any, species_n: Any) -> tuple[Any
         its mesh (egg-box) error from energies, forces and stress (review H2/M5, D-017).
 
     Algorithm:
-        Radial Fourier transforms on a dense k grid (0..80 Bohr⁻¹), a cubic spline of :math:`W` on
-        :math:`R\in[0, r_{c,v} + r_{c,n}]`, cached per species pair.
+        Radial Fourier transforms on a dense k grid (0..80 Bohr⁻¹) and the back transform on 1201 points
+        :math:`R\in[0, r_{c,v} + r_{c,n}]`, both by the trapezoid rule in ``jsiesta_na_density_table``
+        (threaded C++); a cubic spline of :math:`W`, cached per pair of radial functions (most recent 64).
 
     Parameters:
         species_v: Species owning :math:`V_{NA}`.
@@ -75,26 +70,37 @@ def neutral_atom_density_two_center(species_v: Any, species_n: Any) -> tuple[Any
     SIESTA Mapping:
         SIESTA's ``Ena`` two-centre term (``naefs``) with ``DEna`` on the mesh (``dhscf``).
     """
-    r_v = np.asarray(species_v.r_grid, dtype=np.float64)
-    r_n = np.asarray(species_n.r_grid, dtype=np.float64)
-    v = np.asarray(species_v.v_na, dtype=np.float64)
-    n = np.asarray(species_n.rho_na, dtype=np.float64)
+    r_v = np.ascontiguousarray(species_v.r_grid, dtype=np.float64)
+    r_n = np.ascontiguousarray(species_n.r_grid, dtype=np.float64)
+    v = np.ascontiguousarray(species_v.v_na, dtype=np.float64)
+    n = np.ascontiguousarray(species_n.rho_na, dtype=np.float64)
     key = tuple(hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest() for a in (r_v, v, r_n, n))
     if key in _W_CACHE:
         return _W_CACHE[key]
     rc_v = float(r_v[np.nonzero(np.abs(v) > 0.0)[0][-1]]) if np.any(v) else float(r_v[-1])
     rc_n = float(r_n[np.nonzero(n > 0.0)[0][-1]]) if np.any(n) else float(r_n[-1])
-    k = np.linspace(0.0, 80.0, 8001)
-    integrand = k**2 * _radial_ft(r_v, v, k) * _radial_ft(r_n, n, k)
     r_cut = rc_v + rc_n
-    big_r = np.linspace(0.0, r_cut, 1201)
-    kr = np.outer(big_r, k)
-    j0 = np.where(kr > 1e-12, np.sin(kr) / np.where(kr > 1e-12, kr, 1.0), 1.0)
-    w_vals = np.trapezoid(j0 * integrand[None, :], k, axis=1) / (2.0 * np.pi**2)
-    w_vals[-1] = 0.0
+    n_big_r = 1201
+    w_vals = np.zeros(n_big_r, dtype=np.float64)
+    lib = load_ffi_library()
+    _setup_c_signatures(lib)
+    rc = lib.jsiesta_na_density_table(
+        r_v.size, _f64_ptr(r_v), _f64_ptr(v), r_n.size, _f64_ptr(r_n), _f64_ptr(n), 8001, 80.0, n_big_r, r_cut,
+        _f64_ptr(w_vals),
+    )
+    if rc != 0:
+        raise RuntimeError(f"jsiesta_na_density_table failed with code {rc}")
+    big_r = np.linspace(0.0, r_cut, n_big_r)
     out = (CubicSpline(big_r, w_vals, bc_type=((1, 0.0), (1, 0.0))), r_cut)
+    if len(_W_CACHE) >= _W_CACHE_MAX:
+        _W_CACHE.pop(next(iter(_W_CACHE)))
     _W_CACHE[key] = out
     return out
+
+
+def _f64_ptr(a: np.ndarray) -> Any:
+    """``ctypes`` pointer to the data of a C-contiguous float64 array."""
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
 
 
 def neutral_atom_self_energy(species: Any) -> float:
@@ -177,6 +183,11 @@ def _setup_c_signatures(lib: ctypes.CDLL) -> None:
         c_i32, c_i32_p, c_i32_p, c_f64_p, c_f64_p, c_f64_p,
     ]
     lib.jsiesta_eval_na_pair.restype = c_i32
+
+    lib.jsiesta_na_density_table.argtypes = [
+        c_i32, c_f64_p, c_f64_p, c_i32, c_f64_p, c_f64_p, c_i32, ctypes.c_double, c_i32, ctypes.c_double, c_f64_p,
+    ]
+    lib.jsiesta_na_density_table.restype = c_i32
     lib._two_center_configured = True  # type: ignore[attr-defined]
 
 

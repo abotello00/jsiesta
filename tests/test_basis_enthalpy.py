@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -32,7 +33,9 @@ from jax_siesta.species.pao_generator import (
     generate_species_from_psml,
 )
 from jax_siesta.species.psml import PSMLBasisLoader
-from jax_siesta.symmetry.engine import build_native_symmetry
+from jax_siesta.scf.driver import build_monkhorst_pack_mesh
+from jax_siesta.species import basis_opt
+from jax_siesta.symmetry.engine import NativeSymmetrySetupCache, build_native_symmetry
 from jax_siesta.testing.external_refs import ref_path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -333,3 +336,73 @@ def test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage() ->
     auto_space = default_opt_space_from_psml({"Si": psml}, basis_size="DZP", xc="PBE")
     assert auto_space.ndim > 9
     assert abs(to_optimizer_u(to_physical_x(0.7, 1.0, 5.0), 1.0, 5.0) - 0.7) < 1e-10
+
+
+def _two_shell_space() -> MappedBasisSpace:
+    return MappedBasisSpace.from_species_configs(
+        {
+            "Si": (
+                ShellOptConfig(n=3, l=0, n_zeta=1, rc_guess=5.4, rc_initials=(5.4,)),
+                ShellOptConfig(n=3, l=1, n_zeta=1, rc_guess=6.7, rc_initials=(6.7,)),
+            )
+        },
+        xc="PBE",
+        optimize_rc=True,
+        optimize_v0=False,
+        optimize_ri=False,
+        optimize_q=False,
+    )
+
+
+def test_objective_without_symmetry_uses_the_k_shifts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The full-zone path samples the shifted mesh it is given (it used to drop ``k_shifts``)."""
+    seen = {}
+
+    def _stop_after_setup(structure, basis, pattern, tc, kmesh, config, **kwargs):  # type: ignore[no-untyped-def]
+        seen["kmesh"] = kmesh
+        raise RuntimeError("set-up checked")
+
+    monkeypatch.setattr(basis_opt, "run_scf", _stop_after_setup)
+    # the orbitals do not matter here: use the fixture species instead of generating them (slow on this fixture)
+    fixture_species = PSMLBasisLoader().load_species("Si", str(_FIXTURE_SI_PSML))
+    monkeypatch.setattr(basis_opt, "generate_species_from_psml", lambda *a, **k: (fixture_species, {"shells": []}))
+    cfg = SCFConfig(nspin=1, xc_functional="PBE", mesh_cutoff_ry=40.0, use_symmetry=False)
+    space = _two_shell_space()
+    target = BasisTrainingStructure(structure=_si_diamond_structure(), k_grid=(2, 2, 2), k_shifts=(0.5, 0.5, 0.5))
+    obj = BasisEnthalpyObjective(space, {"Si": _FIXTURE_SI_PSML}, [target], cfg)
+    assert obj(space.initial_u()) == 1e10
+    expected = build_monkhorst_pack_mesh((2, 2, 2), (0.5, 0.5, 0.5))
+    np.testing.assert_array_equal(np.asarray(seen["kmesh"].kpoints_frac), np.asarray(expected.kpoints_frac))
+
+
+def test_symmetry_setup_cache_reuses_the_engine_while_the_neighbour_set_is_unchanged() -> None:
+    """Two bases with the same layout and neighbour set share one engine; it matches a fresh build."""
+    struct = _si_diamond_structure()
+    cfg = SCFConfig(nspin=1, xc_functional="PBE", mesh_cutoff_ry=40.0, use_symmetry=True)
+    loader = PSMLBasisLoader()
+    sp_a = loader.load_species("Si", str(_FIXTURE_SI_PSML))
+    # different orbital shapes, same cut-off radii (so the same neighbour set)
+    sp_b = replace(sp_a, pao_values=jnp.asarray(sp_a.pao_values) * (1.0 + 0.05 * jnp.asarray(sp_a.pao_r)[None, :] / 10.0))
+    basis_a = loader.build_basis(struct, {"Si": sp_a})
+    basis_b = loader.build_basis(struct, {"Si": sp_b})
+    cache = NativeSymmetrySetupCache(struct, (2, 2, 2), cfg, k_shifts=(0.5, 0.5, 0.5))
+    eng_a, pat_a, km_a, mesh_a = cache.build(basis_a)
+    eng_b, pat_b, _, mesh_b = cache.build(basis_b)
+    assert eng_b is eng_a and pat_b is pat_a and mesh_b == mesh_a
+    assert (cache.n_builds, cache.n_reuses) == (1, 1)
+
+    eng_f, pat_f, km_f, mesh_f = build_native_symmetry(struct, basis_b, (2, 2, 2), cfg, k_shifts=(0.5, 0.5, 0.5))
+    assert mesh_f == mesh_a
+    np.testing.assert_array_equal(np.asarray(pat_f.src_orb), np.asarray(pat_a.src_orb))
+    np.testing.assert_array_equal(np.asarray(pat_f.edge_cell_idx), np.asarray(pat_a.edge_cell_idx))
+    np.testing.assert_array_equal(np.asarray(km_f.kpoints_frac), np.asarray(km_a.kpoints_frac))
+    np.testing.assert_array_equal(np.asarray(eng_f.proj_table.src_idx), np.asarray(eng_a.proj_table.src_idx))
+    np.testing.assert_array_equal(np.asarray(eng_f.proj_table.weights), np.asarray(eng_a.proj_table.weights))
+    # the shared engine projects the new basis' overlap exactly as the fresh one does
+    tc_b = eng_a.evaluate_irreducible_two_center(struct, basis_b, pat_a, cfg)
+    tc_f = eng_f.evaluate_irreducible_two_center(struct, basis_b, pat_f, cfg)
+    np.testing.assert_array_equal(np.asarray(tc_b.overlap), np.asarray(tc_f.overlap))
+    np.testing.assert_array_equal(
+        np.asarray(eng_a.project_matrix(tc_b.overlap[None, :], 1)), np.asarray(eng_f.project_matrix(tc_f.overlap[None, :], 1))
+    )
+

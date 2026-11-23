@@ -193,4 +193,49 @@ int32_t jsiesta_eval_na_pair(
     double* out_e,
     double* out_de_dr);
 
+/**
+ * @brief Tabulate \f$W(R) = \int V_{NA,v}(\mathbf r)\, n_{\text{at},n}(\mathbf r - \mathbf R)\, d^3r\f$ for one species pair.
+ *
+ * @par Theory
+ * Both functions are spherical, so \f$W(R) = \frac{1}{2\pi^2}\int_0^\infty k^2\,\hat V(k)\,\hat n(k)\, j_0(kR)\, dk\f$ with
+ * \f$\hat f(k) = 4\pi\int_0^\infty r^2 f(r)\, j_0(kr)\, dr\f$. It is the exact atomic part of the neutral-atom grid
+ * energy (D-017).
+ *
+ * @par Algorithm
+ * Trapezoid rules on the given radial grids for \f$\hat V\f$ and \f$\hat n\f$ on a uniform k grid
+ * \f$[0, k_{\max}]\f$ of \c n_k points, threaded over k; then a trapezoid rule over k for each of \c n_big_r uniform
+ * points \f$R \in [0, r_{\text{cut}}]\f$, threaded over R. The last value is set to zero.
+ *
+ * @param n_rv Number of radial points of \c v.
+ * @param r_v Radial grid of \c v (Bohr).
+ * @param v Neutral-atom potential \f$V_{NA}(r)\f$ (Ha).
+ * @param n_rn Number of radial points of \c n.
+ * @param r_n Radial grid of \c n (Bohr).
+ * @param n Atomic valence density \f$n_{\text{at}}(r)\f$ (electrons/Bohr^3).
+ * @param n_k Number of k points.
+ * @param k_max Largest k (1/Bohr).
+ * @param n_big_r Number of R points.
+ * @param r_cut Largest R (Bohr), \f$r_{c,v} + r_{c,n}\f$.
+ * @param out_w Output \f$W(R_i)\f$ (Ha), length \c n_big_r.
+ * @return 0 on success, 1 on invalid sizes.
+ *
+ * @par Invariants
+ * Equals the NumPy reference (\c numpy.trapezoid on the same grids) to rounding; \f$W(r_{\text{cut}}) = 0\f$.
+ *
+ * @par SIESTA Mapping
+ * SIESTA's \c Ena two-centre term (\c naefs); SIESTA tabulates it with its own radial Fourier transforms.
+ */
+int32_t jsiesta_na_density_table(
+    int32_t n_rv,
+    const double* r_v,
+    const double* v,
+    int32_t n_rn,
+    const double* r_n,
+    const double* n,
+    int32_t n_k,
+    double k_max,
+    int32_t n_big_r,
+    double r_cut,
+    double* out_w);
+
 }  // extern "C"

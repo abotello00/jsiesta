@@ -287,3 +287,11 @@
 - A100 job 29635599: 26 CUDA and compilation tests pass; second geometry Si 512 PBE 64.8 s -> 52.6 s, Si 64 6.7 s ->
   5.1 s; energies identical; 55 laptop grid/SCF/force tests pass.
 
+### 2026-11-24 — Basis-optimisation performance (D-049) (Claude Code)
+- Profiled `BasisEnthalpyObjective` stage by stage (Si 2 atoms; SiC DZP with 3 lattice constants).
+- Fixed the dropped `k_shifts` in the full-zone objective and in `run_case`.
+- Added `NativeSymmetrySetupCache`, the padded-row projection table, the C++ neutral-atom density table, the C++ radial
+  table cache with hoisted inner-loop terms; the symmetric objective uses the full two-centre evaluator.
+- A100 jobs 29639602 and 29639684: SiC per evaluation 1.86 s (GPU), 5.0 s (18 CPU threads), SIESTA 23.8 s.
+- Tried and dropped an SCF warm start from the previous density matrix (under 10 % fewer iterations).
+

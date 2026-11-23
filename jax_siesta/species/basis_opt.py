@@ -62,6 +62,7 @@ from jax_siesta.species.pao_generator import (
     generate_species_from_psml,
 )
 from jax_siesta.species.psml import PSMLBasisLoader, build_sparse_pattern
+from jax_siesta.symmetry.engine import NativeSymmetrySetupCache
 
 # 1 GPa in eV / Bohr^3, from SIESTA's own units (Src/libunits/units_codata2018.f90, internal energy unit Ry):
 # GPa = 6.79786184348648780e-5 Ry/Bohr^3 and eV = 7.34986443513115789e-2 Ry. Until 2026-11-22 this constant held the Ry
@@ -719,7 +720,9 @@ class BasisEnthalpyObjective:
     Algorithm:
         Pre-parses geometry/PSML metadata once, evaluates each candidate strictly in memory
         (zero external subprocesses or temporary `.ion` files), tracks the best evaluation,
-        and records convergence history.
+        and records convergence history. With symmetry, the set-up of each target is kept in a
+        :class:`~jax_siesta.symmetry.engine.NativeSymmetrySetupCache` and reused while the orbital
+        layout and the neighbour set do not change.
 
     Invariants:
         - Strictly valid orbital parameters on every evaluation via :class:`MappedBasisSpace`.
@@ -754,6 +757,17 @@ class BasisEnthalpyObjective:
         self.best_effective_params: dict[str, float] | None = None
         self.best_specs: dict[str, SpeciesBasisSpec] | None = None
         self.history: list[dict[str, Any]] = []
+        # symmetry set-up per target, reused while the orbital layout and the neighbour set do not change
+        self._sym_caches: dict[int, NativeSymmetrySetupCache] = {}
+
+    def _symmetry_cache(self, i_tgt: int) -> NativeSymmetrySetupCache:
+        """The symmetry set-up cache of target ``i_tgt`` (created on first use)."""
+        cache = self._sym_caches.get(i_tgt)
+        if cache is None:
+            tgt = self.targets[i_tgt]
+            cache = NativeSymmetrySetupCache(tgt.structure, tgt.k_grid, self.scf_config, k_shifts=tgt.k_shifts)
+            self._sym_caches[i_tgt] = cache
+        return cache
 
     def evaluate_details(
         self, u: np.ndarray
@@ -796,23 +810,21 @@ class BasisEnthalpyObjective:
         h_acc = 0.0
         e_acc = 0.0
         v_acc = 0.0
-        for tgt in self.targets:
+        for i_tgt, tgt in enumerate(self.targets):
             basis = self._loader.build_basis(
                 tgt.structure,
                 species_map,
                 include_soc_projectors=(self.scf_config.nspin == 8),
             )
             if self.scf_config.use_symmetry:
-                from jax_siesta.symmetry.engine import build_native_symmetry
-
-                sym_proj, pat, kmesh, mesh_shape = build_native_symmetry(
-                    tgt.structure, basis, tgt.k_grid, self.scf_config, k_shifts=tgt.k_shifts
-                )
-                tc = sym_proj.evaluate_irreducible_two_center(tgt.structure, basis, pat, self.scf_config)
+                sym_proj, pat, kmesh, mesh_shape = self._symmetry_cache(i_tgt).build(basis)
+                # the threaded full evaluation on the symmetry-closed pattern is faster than the irreducible-orbit path
+                # (Python orbit bookkeeping) and equal to it to rounding (1e-14)
+                tc = self._tc_eval.evaluate(tgt.structure, basis, pat, self.scf_config)
             else:
                 sym_proj = None
                 pat = build_sparse_pattern(tgt.structure, basis)
-                kmesh = build_monkhorst_pack_mesh(tgt.k_grid)
+                kmesh = build_monkhorst_pack_mesh(tgt.k_grid, tgt.k_shifts)
                 mesh_shape = choose_mesh_dimensions(
                     tgt.structure.cell,
                     self.scf_config.mesh_cutoff_ry,

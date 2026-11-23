@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -198,25 +200,31 @@ PairRadialSplines build_pair_splines(
         dfact[L] = dfact[L - 1] * static_cast<double>(2 * L + 1);
     }
 
+    // the k weights times the transforms and R^L do not depend on R and k respectively: computed once (same values)
+    std::vector<double> w_prod_k(k_pts.size());
+    for (size_t ik = 0; ik < k_pts.size(); ++ik) {
+        const double k = k_pts[ik];
+        const double k_factor = is_kinetic ? (0.5 * k * k * k * k) : (k * k);
+        w_prod_k[ik] = k_wts[ik] * k_factor * rt1.f_k[ik] * rt2.f_k[ik];
+    }
+    std::vector<double> r_pow_L(n_L, 1.0);
     for (int ir = 0; ir < kNumRSpline; ++ir) {
         const double R = static_cast<double>(ir) * dr;
+        for (int iL = 0; iL < n_L; ++iL) r_pow_L[iL] = std::pow(R, prs.L_vals[iL]);
         for (size_t ik = 0; ik < k_pts.size(); ++ik) {
             const double k = k_pts[ik];
-            const double k_factor = is_kinetic ? (0.5 * k * k * k * k) : (k * k);
-            const double w_prod = k_wts[ik] * k_factor * rt1.f_k[ik] * rt2.f_k[ik];
+            const double w_prod = w_prod_k[ik];
             if (R < 1e-6) {
-                double k_pow = 1.0;
                 for (int iL = 0; iL < n_L; ++iL) {
                     const int L = prs.L_vals[iL];
                     const double j_over_rL = std::pow(k, L) / dfact[L];
                     curves[iL][ir] += w_prod * j_over_rL;
-                    (void)k_pow;
                 }
             } else {
                 jsiesta::math::spherical_bessel_jl(l_max, k * R, jl.data());
                 for (int iL = 0; iL < n_L; ++iL) {
                     const int L = prs.L_vals[iL];
-                    curves[iL][ir] += w_prod * (jl[L] / std::pow(R, L));
+                    curves[iL][ir] += w_prod * (jl[L] / r_pow_L[iL]);
                 }
             }
         }
@@ -284,6 +292,65 @@ void eval_pair_element(
     }
 }
 
+// Radial tables of one set of radial functions, kept between calls. The tables depend only on the radial functions
+// (not on the atomic positions), so several structures with the same basis (the training set of a basis
+// optimisation, the lattice constants of an equation of state) build them once. Pair tables are built on first use.
+struct PairTableSet {
+    std::vector<double> key;                 // exact copy of the radial inputs
+    std::vector<RadialTransform> rts_a;      // transforms of the first function set (orbitals)
+    std::vector<RadialTransform> rts_b;      // transforms of the second set (orbitals again, or KB projectors)
+    int n_per_pair = 1;                      // tables per pair (2 for overlap and kinetic)
+    std::vector<PairRadialSplines> tables;   // [pid * n_per_pair + j], pid = a * rts_b.size() + b
+    std::vector<char> built;                 // per pid
+};
+
+void append_key(std::vector<double>& key, int32_t n, const double* v) { key.insert(key.end(), v, v + n); }
+void append_key(std::vector<double>& key, int32_t n, const int32_t* v) {
+    for (int32_t i = 0; i < n; ++i) key.push_back(static_cast<double>(v[i]));
+}
+
+// Returns the cached set with this key (most recent first, at most 4 kept), or a new empty one; caller holds the lock.
+std::shared_ptr<PairTableSet> find_table_set(std::vector<std::shared_ptr<PairTableSet>>& cache, std::vector<double>&& key,
+                                            bool& is_new) {
+    for (size_t i = 0; i < cache.size(); ++i) {
+        if (cache[i]->key == key) {
+            auto found = cache[i];
+            cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(i));
+            cache.insert(cache.begin(), found);
+            is_new = false;
+            return found;
+        }
+    }
+    auto set = std::make_shared<PairTableSet>();
+    set->key = std::move(key);
+    cache.insert(cache.begin(), set);
+    if (cache.size() > 4) cache.resize(4);
+    is_new = true;
+    return set;
+}
+
+// Builds the tables of the pairs in needed that are not built yet, threaded over tables; caller holds the lock.
+void build_missing_pairs(PairTableSet& set, const std::vector<int>& needed, const std::vector<double>& k_pts,
+                         const std::vector<double>& k_wts) {
+    std::vector<int> todo;
+    for (const int pid : needed) {
+        if (!set.built[static_cast<size_t>(pid)]) todo.push_back(pid);
+    }
+    const int n_b = static_cast<int>(set.rts_b.size());
+    const int n_tab = set.n_per_pair * static_cast<int>(todo.size());
+    jsiesta::threading::parallel_ranges(
+        n_tab, jsiesta::threading::thread_count(n_tab, 2), [&](int, int64_t lo, int64_t hi) {
+            for (int64_t i = lo; i < hi; ++i) {
+                const int pid = todo[static_cast<size_t>(i / set.n_per_pair)];
+                const int j = static_cast<int>(i % set.n_per_pair);
+                set.tables[static_cast<size_t>(pid * set.n_per_pair + j)] =
+                    build_pair_splines(set.rts_a[static_cast<size_t>(pid / n_b)], set.rts_b[static_cast<size_t>(pid % n_b)],
+                                       k_pts, k_wts, j == 1);
+            }
+        });
+    for (const int pid : todo) set.built[static_cast<size_t>(pid)] = 1;
+}
+
 }  // namespace
 
 extern "C" {
@@ -307,19 +374,13 @@ int32_t jsiesta_eval_two_center_st(
     double* out_dt) {
     if (n_shells <= 0 || n_pao_pts < 2 || n_edges < 0) return 1;
 
+    for (int s = 0; s < n_shells; ++s) {
+        if (pao_l[s] > kMaxL) return 2;
+    }
     std::vector<double> k_pts, k_wts;
     compute_k_grid(k_pts, k_wts);
 
-    std::vector<RadialTransform> rts(n_shells);
-    for (int s = 0; s < n_shells; ++s) {
-        if (pao_l[s] > kMaxL) return 2;
-        rts[s] = hankel_transform(
-            pao_values + static_cast<size_t>(s) * n_pao_pts,
-            n_pao_pts, pao_r_max[s], pao_rcut[s], pao_l[s], k_pts);
-    }
-
     const int n_pairs = n_shells * n_shells;
-    std::vector<PairRadialSplines> s_splines(n_pairs), t_splines(n_pairs);
     std::vector<bool> used_pairs(n_pairs, false);
     for (int e = 0; e < n_edges; ++e) {
         used_pairs[edge_shell1[e] * n_shells + edge_shell2[e]] = true;
@@ -328,20 +389,35 @@ int32_t jsiesta_eval_two_center_st(
     for (int pid = 0; pid < n_pairs; ++pid) {
         if (used_pairs[pid]) used.push_back(pid);
     }
-    // The radial tables of the shell pairs are independent: one range of pairs per thread.
-    const int n_tab = 2 * static_cast<int>(used.size());
-    jsiesta::threading::parallel_ranges(
-        n_tab, jsiesta::threading::thread_count(n_tab, 2), [&](int, int64_t lo, int64_t hi) {
-            for (int64_t i = lo; i < hi; ++i) {
-                const int pid = used[static_cast<size_t>(i / 2)];
-                const int s1 = pid / n_shells, s2 = pid % n_shells;
-                if (i % 2 == 0) {
-                    s_splines[pid] = build_pair_splines(rts[s1], rts[s2], k_pts, k_wts, false);
-                } else {
-                    t_splines[pid] = build_pair_splines(rts[s1], rts[s2], k_pts, k_wts, true);
-                }
+
+    static std::mutex cache_mu;
+    static std::vector<std::shared_ptr<PairTableSet>> cache;
+    std::vector<double> key{static_cast<double>(n_shells), static_cast<double>(n_pao_pts)};
+    append_key(key, n_shells, pao_r_max);
+    append_key(key, n_shells, pao_rcut);
+    append_key(key, n_shells, pao_l);
+    append_key(key, n_shells * n_pao_pts, pao_values);
+    std::shared_ptr<PairTableSet> set;
+    {
+        std::lock_guard<std::mutex> lock(cache_mu);
+        bool is_new = false;
+        set = find_table_set(cache, std::move(key), is_new);
+        if (is_new) {
+            set->rts_a.resize(n_shells);
+            for (int s = 0; s < n_shells; ++s) {
+                set->rts_a[s] = hankel_transform(
+                    pao_values + static_cast<size_t>(s) * n_pao_pts,
+                    n_pao_pts, pao_r_max[s], pao_rcut[s], pao_l[s], k_pts);
             }
-        });
+            set->rts_b = set->rts_a;
+            set->n_per_pair = 2;
+            set->tables.resize(static_cast<size_t>(2 * n_pairs));
+            set->built.assign(static_cast<size_t>(n_pairs), 0);
+        }
+        // the radial tables of the shell pairs are independent: threaded over tables
+        build_missing_pairs(*set, used, k_pts, k_wts);
+    }
+    const PairRadialSplines* tabs = set->tables.data();
 
     // Orbital pairs in ranges, one per thread. Consecutive pairs of a pattern row usually share the atom-pair vector,
     // so the solid harmonics are recomputed only when the vector changes (same values either way).
@@ -366,10 +442,10 @@ int32_t jsiesta_eval_two_center_st(
                     have_last = true;
                 }
                 eval_pair_element(
-                    s_splines[pid], edge_m1[e], edge_m2[e], rx, ry, rz,
+                    tabs[2 * pid], edge_m1[e], edge_m2[e], rx, ry, rz,
                     c_lm.data(), dc_lm.data(), out_s[e], out_ds + 3 * e);
                 eval_pair_element(
-                    t_splines[pid], edge_m1[e], edge_m2[e], rx, ry, rz,
+                    tabs[2 * pid + 1], edge_m1[e], edge_m2[e], rx, ry, rz,
                     c_lm.data(), dc_lm.data(), out_t[e], out_dt + 3 * e);
             }
         });
@@ -399,24 +475,15 @@ int32_t jsiesta_eval_kb_overlaps(
     double* out_dp) {
     if (n_pao_shells <= 0 || n_kb_shells <= 0 || n_links < 0) return 1;
 
-    std::vector<double> k_pts, k_wts;
-    compute_k_grid(k_pts, k_wts);
-
-    std::vector<RadialTransform> rts_pao(n_pao_shells), rts_kb(n_kb_shells);
     for (int s = 0; s < n_pao_shells; ++s) {
         if (pao_l[s] > kMaxL) return 2;
-        rts_pao[s] = hankel_transform(
-            pao_values + static_cast<size_t>(s) * n_pao_pts,
-            n_pao_pts, pao_r_max[s], pao_rcut[s], pao_l[s], k_pts);
     }
     for (int k = 0; k < n_kb_shells; ++k) {
         if (kb_l[k] > kMaxL) return 2;
-        rts_kb[k] = hankel_transform(
-            kb_values + static_cast<size_t>(k) * n_kb_pts,
-            n_kb_pts, kb_r_max[k], kb_rcut[k], kb_l[k], k_pts);
     }
+    std::vector<double> k_pts, k_wts;
+    compute_k_grid(k_pts, k_wts);
 
-    std::vector<PairRadialSplines> p_splines(n_pao_shells * n_kb_shells);
     std::vector<bool> used_links(n_pao_shells * n_kb_shells, false);
     for (int i = 0; i < n_links; ++i) {
         used_links[link_pao_shell[i] * n_kb_shells + link_kb_shell[i]] = true;
@@ -425,14 +492,44 @@ int32_t jsiesta_eval_kb_overlaps(
     for (int pid = 0; pid < n_pao_shells * n_kb_shells; ++pid) {
         if (used_links[pid]) used.push_back(pid);
     }
-    const int n_used = static_cast<int>(used.size());
-    jsiesta::threading::parallel_ranges(
-        n_used, jsiesta::threading::thread_count(n_used, 2), [&](int, int64_t lo, int64_t hi) {
-            for (int64_t i = lo; i < hi; ++i) {
-                const int pid = used[static_cast<size_t>(i)];
-                p_splines[pid] = build_pair_splines(rts_pao[pid / n_kb_shells], rts_kb[pid % n_kb_shells], k_pts, k_wts, false);
+
+    static std::mutex cache_mu;
+    static std::vector<std::shared_ptr<PairTableSet>> cache;
+    std::vector<double> key{static_cast<double>(n_pao_shells), static_cast<double>(n_pao_pts),
+                            static_cast<double>(n_kb_shells), static_cast<double>(n_kb_pts)};
+    append_key(key, n_pao_shells, pao_r_max);
+    append_key(key, n_pao_shells, pao_rcut);
+    append_key(key, n_pao_shells, pao_l);
+    append_key(key, n_pao_shells * n_pao_pts, pao_values);
+    append_key(key, n_kb_shells, kb_r_max);
+    append_key(key, n_kb_shells, kb_rcut);
+    append_key(key, n_kb_shells, kb_l);
+    append_key(key, n_kb_shells * n_kb_pts, kb_values);
+    std::shared_ptr<PairTableSet> set;
+    {
+        std::lock_guard<std::mutex> lock(cache_mu);
+        bool is_new = false;
+        set = find_table_set(cache, std::move(key), is_new);
+        if (is_new) {
+            set->rts_a.resize(n_pao_shells);
+            set->rts_b.resize(n_kb_shells);
+            for (int s = 0; s < n_pao_shells; ++s) {
+                set->rts_a[s] = hankel_transform(
+                    pao_values + static_cast<size_t>(s) * n_pao_pts,
+                    n_pao_pts, pao_r_max[s], pao_rcut[s], pao_l[s], k_pts);
             }
-        });
+            for (int k = 0; k < n_kb_shells; ++k) {
+                set->rts_b[k] = hankel_transform(
+                    kb_values + static_cast<size_t>(k) * n_kb_pts,
+                    n_kb_pts, kb_r_max[k], kb_rcut[k], kb_l[k], k_pts);
+            }
+            set->n_per_pair = 1;
+            set->tables.resize(static_cast<size_t>(n_pao_shells * n_kb_shells));
+            set->built.assign(static_cast<size_t>(n_pao_shells * n_kb_shells), 0);
+        }
+        build_missing_pairs(*set, used, k_pts, k_wts);
+    }
+    const PairRadialSplines* p_tabs = set->tables.data();
 
     // Links in ranges, one per thread; the solid harmonics are recomputed only when the link vector changes.
     const int n_big = (kMaxBigL + 1) * (kMaxBigL + 1);
@@ -455,7 +552,7 @@ int32_t jsiesta_eval_kb_overlaps(
                     have_last = true;
                 }
                 eval_pair_element(
-                    p_splines[s * n_kb_shells + k],
+                    p_tabs[s * n_kb_shells + k],
                     link_m1[i], link_m2[i], rx, ry, rz,
                     c_lm.data(), dc_lm.data(), out_p[i], out_dp + 3 * i);
             }
@@ -531,6 +628,63 @@ int32_t jsiesta_eval_na_pair(
             out_de_dr[p] = (-z12 / (R * R)) + dov_dr;
         }
     }
+    return 0;
+}
+
+int32_t jsiesta_na_density_table(
+    int32_t n_rv,
+    const double* r_v,
+    const double* v,
+    int32_t n_rn,
+    const double* r_n,
+    const double* n,
+    int32_t n_k,
+    double k_max,
+    int32_t n_big_r,
+    double r_cut,
+    double* out_w) {
+    if (n_rv < 2 || n_rn < 2 || n_k < 2 || n_big_r < 2) return 1;
+    auto j0 = [](double x) { return x > 1e-12 ? std::sin(x) / x : 1.0; };
+    const double dk = k_max / static_cast<double>(n_k - 1);
+    std::vector<double> k(static_cast<size_t>(n_k));
+    for (int32_t m = 0; m < n_k; ++m) k[static_cast<size_t>(m)] = static_cast<double>(m) * dk;
+    k[static_cast<size_t>(n_k - 1)] = k_max;
+    // radial Fourier transform 4 pi int r^2 f(r) j0(k r) dr by the trapezoid rule on the given grid
+    auto radial_ft = [&](int32_t m, const double* r, const double* f, int32_t nr) {
+        double sum = 0.0;
+        double y_prev = j0(k[static_cast<size_t>(m)] * r[0]) * r[0] * r[0] * f[0];
+        for (int32_t i = 1; i < nr; ++i) {
+            const double y = j0(k[static_cast<size_t>(m)] * r[i]) * r[i] * r[i] * f[i];
+            sum += 0.5 * (r[i] - r[i - 1]) * (y + y_prev);
+            y_prev = y;
+        }
+        return 4.0 * M_PI * sum;
+    };
+    std::vector<double> integrand(static_cast<size_t>(n_k));
+    const int n_thr_k = jsiesta::threading::thread_count(static_cast<std::int64_t>(n_k), 256);
+    jsiesta::threading::parallel_ranges(n_k, n_thr_k, [&](int, std::int64_t lo, std::int64_t hi) {
+        for (std::int64_t m = lo; m < hi; ++m) {
+            const auto mi = static_cast<int32_t>(m);
+            const double km = k[static_cast<size_t>(m)];
+            integrand[static_cast<size_t>(m)] = km * km * radial_ft(mi, r_v, v, n_rv) * radial_ft(mi, r_n, n, n_rn);
+        }
+    });
+    const double d_big_r = r_cut / static_cast<double>(n_big_r - 1);
+    const int n_thr_r = jsiesta::threading::thread_count(static_cast<std::int64_t>(n_big_r), 32);
+    jsiesta::threading::parallel_ranges(n_big_r, n_thr_r, [&](int, std::int64_t lo, std::int64_t hi) {
+        for (std::int64_t i = lo; i < hi; ++i) {
+            const double big_r = (i == n_big_r - 1) ? r_cut : static_cast<double>(i) * d_big_r;
+            double sum = 0.0;
+            double y_prev = j0(big_r * k[0]) * integrand[0];
+            for (int32_t m = 1; m < n_k; ++m) {
+                const double y = j0(big_r * k[static_cast<size_t>(m)]) * integrand[static_cast<size_t>(m)];
+                sum += 0.5 * (k[static_cast<size_t>(m)] - k[static_cast<size_t>(m - 1)]) * (y + y_prev);
+                y_prev = y;
+            }
+            out_w[i] = sum / (2.0 * M_PI * M_PI);
+        }
+    });
+    out_w[n_big_r - 1] = 0.0;
     return 0;
 }
 

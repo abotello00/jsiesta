@@ -4,7 +4,7 @@ Theory:
     Provides space/magnetic group detection (``extract_space_group``), IBZ k-point
     reduction (``build_ibz_kpoint_mesh``), symmetry-commensurate grid mapping
     (``choose_commensurate_mesh_dimensions``, ``precompute_grid_permutations``),
-    symmetry-closed sparse patterns and Wigner-D/SU(2) ``segment_sum`` projection
+    symmetry-closed sparse patterns and Wigner-D/SU(2) sparse projection
     (``compile_projection_table``), and the unified ``NativeSymmetryEngine``.
 
 Algorithm:

@@ -959,3 +959,43 @@
   build the richer plan (more host memory, about 20 % more build time). At 512 atoms the sparse pattern (17 s) is now
   the largest per-geometry item, then the host two-centre set-up and force terms (11 s) and the 13 GB gradient-plan
   upload (2.7 s).
+
+## D-049: Basis optimisation: reuse the symmetry set-up and the radial tables, faster projection, k-shift fix (2026-11-24)
+- **Status:** accepted (branch `perf/basis-opt`); measured on the laptop and on the A100 (jobs 29639602, 29639684).
+- **Why:** a profile of `BasisEnthalpyObjective` (Si, 2 atoms, 8 parameters, Nelder-Mead) gave 6.0 s per evaluation, of
+  which 3.0 s rebuilt the symmetry set-up of an unchanged structure (space group, closed pattern, projection table in
+  Python), 1.0 s went to the irreducible two-centre path (Python orbit bookkeeping), 0.5 s to the neutral-atom pair
+  table (NumPy, 16 M `sin` per species pair), 0.2 s to symmetry projections run as a scatter (`segment_sum`, 15 ms each
+  on the CPU), and 8 recompilations per evaluation, because each new engine object changed the static key of the
+  compiled SCF. With several training structures (SiC, DZP, 3 lattice constants) the radial spline tables were rebuilt
+  for each structure although they depend only on the radial functions. Without symmetry the objective (and
+  `run_case`) dropped `k_shifts` and sampled an unshifted mesh: 2.1 eV off the symmetric result at 2x2x2 for Si.
+- **Change:** `NativeSymmetrySetupCache` (`symmetry/engine.py`) keeps the structure part (space group, IBZ k-mesh,
+  commensurate mesh, permutations) and the last 8 engines keyed by orbital layout and distance-cutoff pattern
+  (`same_edges`); a reused engine is the same object, so nothing recompiles. The projection table is stored as padded
+  rows (ELL) and applied as a gather and a row sum in a compiled function (20x faster than the scatter). The
+  neutral-atom density table is the threaded C++ `jsiesta_na_density_table` (same trapezoid rules; 2e-14 Ha from the
+  NumPy version), its Python cache capped at 64 entries. The C++ S/T and KB-overlap entry points keep the radial tables
+  of the last 4 sets of radial functions and build pair tables on first use; `R^L` and the k weights are hoisted out of
+  the inner loop of `build_pair_splines` (bitwise identical). The objective evaluates the two-centre integrals of the
+  symmetric path with the full threaded evaluator on the closed pattern (faster than the irreducible path: 0.68 s vs
+  1.13 s for Si DZP, 0.95 s vs 5.6 s for 16 atoms; equal to 1e-14). `k_shifts` reach the full-zone mesh in the
+  objective and in `run_case`.
+- **Effect:** Si 2 atoms (symmetric, laptop): 6.0 s -> 0.51 s per evaluation (0.36 s on the A100). SiC DZP, 3 lattice
+  constants, 100 Ry, 4x4x4 shifted k, per evaluation on one A100 node share (18 cores): jsiesta 1.86 s on the GPU
+  (symmetric; 1.94 s full zone), 5.0 s on the 18 CPU threads; SIESTA with the same `PAO.Basis` (3 runs) 23.8 s on 1 rank,
+  26.1 s on 18 ranks. On the laptop the same evaluation went from 6.8 s to 4.5 s. The 64-atom two-centre set-up went
+  from 2.27 s to 1.37 s.
+- **Physics:** none beyond the k-shift fix. Enthalpies of the symmetric objective identical to 6 decimals; S, T, their
+  derivatives, V_KB, E_NA and the densities of the 64-atom check bitwise identical; 66 symmetry, two-centre, SCF, force
+  and basis tests and `make check` pass (158 passed; one earlier `make check` run crashed once in `numpy.linalg.solve`
+  inside the rVV10 test and did not reproduce in two reruns).
+- **Tried and dropped:** starting each evaluation's SCF from the previous converged density matrix: 8.0 -> 7.4
+  iterations at `d_tol` 1e-5, none at 1e-6 (the neutral-atom start is already as good).
+- **Known limits:** with symmetry, a new neighbour set still costs the Python set-up (about 15 s for SiC DZP, 54756
+  edges) and a recompilation; for basis optimisation on the GPU the full-zone path is as fast and its first evaluation
+  is 7 s instead of 33 s. The host two-centre integrals are now 58 % of a GPU evaluation (1.08 s of 1.86 s).
+  `format_pao_basis_block` writes a perturbative polarisation shell as an explicit shell (`n=2 2` for C), which SIESTA
+  rejects; SIESTA's form is the `P` flag on the parent shell, which also ties the polarisation cut-off to the parent's
+  (the default optimisation space varies it independently). PAO generation from a PSML without semilocal potentials
+  solves each radial state by a dense `eigh` (2.1 s per state on the 2398-point grid of the test fixture).
