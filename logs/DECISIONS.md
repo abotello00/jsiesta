@@ -871,7 +871,8 @@
   design documents.
 
 ## D-046: Compile once per array shape, not once per geometry (2026-11-23)
-- **Status:** accepted on the CPU (branch `perf/fixed-costs`); A100 measurement pending.
+- **Status:** accepted (branch `perf/fixed-costs`); measured on the A100 (job 29629429: the 26 CUDA and compilation
+  tests pass).
 - **Why:** `run_scf` built its compiled functions as closures over the geometry (positions, neutral-atom density,
   packed basis, overlap), so every new geometry re-traced and recompiled them even with unchanged shapes: 2.2-2.6 s
   for a 2-atom cell on the laptop, about 2 s at 64 atoms and 9 s at 512 on the A100 (from the scaling jobs). A
@@ -894,13 +895,18 @@
   with a warm persistent cache 0.5 s. A new geometry with the same shapes: 4 compilations and 3.7 s -> none and 0.9 s.
   64 atoms (6 SCF iterations + forces, together with D-047): 84.3 s -> 38.9 s for the first geometry, 65.9 s -> 37.8 s
   for the second.
+- **Effect (A100, job 29629429, with D-047; 6 SCF iterations + forces):** Si 64 PBE 39.5 s -> 17.3 s for the first
+  geometry (9.7 s with a warm persistent cache), 19.7 s -> 6.7 s for a displaced second geometry; Si 64 r2SCAN
+  50.3 s -> 15.7 s and 32.2 s -> 10.3 s; Si 512 PBE 182 s -> 98 s (69 s warm), 139 s -> 65 s. With a warm cache the
+  first and second geometries cost the same, so no compilation is left per geometry. At 512 atoms the remaining
+  second-geometry cost (pattern 16 s, SCF 23 s, forces 19 s) is set-up and work, not compilation; it is not broken
+  down yet.
 - **Physics:** none. Energies equal to 6e-14 eV (the initial solve is now compiled instead of eager), forces to 1e-17
   Ha/Bohr; SCF, forces, symmetry, mixer, Harris, meta-GGA/SOC and stress-component tests unchanged (57 passed).
   New `tests/test_compilation.py`: a second geometry with the same shapes compiles nothing; the cache is opt-in.
 
 ## D-047: Threaded host set-up and threaded host Libxc (2026-11-23)
-- **Status:** accepted on the CPU (branch `perf/fixed-costs`); the CUDA + Libxc build compiles on Snellius; A100
-  measurement pending.
+- **Status:** accepted (branch `perf/fixed-costs`); measured on the A100 (job 29629429).
 - **Why:** after D-046 the fixed cost of a geometry is host work, all single-threaded: the grid plan build, the
   overlap/kinetic and KB-overlap integrals (one loop over orbital pairs that recomputed the solid harmonics of the same
   atom-pair vector for every orbital pair, and spline tables built one shell pair at a time), the sparse pattern
@@ -918,9 +924,11 @@
 - **Effect (laptop, 8 threads, 64 Si atoms):** two-centre 6.35 s -> 2.52 s; first value-plan build and `rhoofd`
   5.60 s -> 3.82 s; pattern 1.89 s -> 1.30 s (512 atoms: 17.9 s -> 13.3 s); r2SCAN Libxc evaluation on 72^3 points
   0.197 s -> 0.076 s (spin-unpolarised), 0.366 s -> 0.147 s (polarised).
+- **Effect (A100 node, job 29629429, first geometry):** two-centre 6.23 s -> 1.96 s (64 atoms), 24.7 s -> 7.95 s (512
+  atoms); pattern 1.68 s -> 1.42 s and 18.9 s -> 16.5 s. Energies identical to the previous build to 1e-12 Ha.
 - **Physics:** none. Overlap, kinetic and their derivatives, V_KB, the neutral-atom pair energy, the grid density and
   the plan gradients are bitwise identical to the previous build at 64 atoms; the sparse patterns are identical at 8, 64
   and 512 atoms; the r2SCAN energy density and potentials are bitwise identical.
-- **Known limits:** the pattern builder is still NumPy (13 s at 512 atoms on the laptop: sorting and the transpose
+- **Known limits:** the pattern builder is still NumPy (13 s at 512 atoms on the laptop, 16 s on the A100 node: sorting and the transpose
   search over 12.7 M edges); a C++ builder would remove most of it.
 

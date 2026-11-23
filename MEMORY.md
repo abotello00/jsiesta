@@ -52,13 +52,15 @@
 - Forces + stress 0.31–6.5 s (8–512 atoms): faster than SIESTA on 18 ranks from 64 atoms up, 2–4x slower than 192.
 - r2SCAN forces + stress at 512 atoms 14.8 s with the Hessian plan streamed from host memory (D-043, D-044).
 - Set-up and compilation dominate small cells: 7.7 s + 19 s at 64 atoms against 0.5 s for SIESTA's set-up (A100,
-  before D-046/D-047; on the laptop those two cut a 64-atom single point from 84 s to 39 s, A100 numbers pending).
+  before D-046/D-047). After them (job 29629429, 6 SCF iterations + forces): Si 64 PBE 39.5 s -> 17.3 s (9.7 s with
+  a warm cache), a second geometry 19.7 s -> 6.7 s; Si 512 PBE 182 s -> 98 s, second geometry 139 s -> 65 s.
 
 ## Open issues
 
 - **Set-up and compilation cost:** reduced by D-046 (no recompilation per geometry, far fewer first-call
-  compilations, opt-in persistent cache) and D-047 (threaded host builds); the A100 effect is not measured yet. The
-  sparse pattern is still NumPy (13 s at 512 atoms on the laptop).
+  compilations, opt-in persistent cache) and D-047 (threaded host builds), measured on the A100. The sparse pattern is
+  still NumPy and now the largest set-up item at 512 atoms (16 s on the A100 node); the rest of the 512-atom
+  per-geometry cost (SCF 23 s, forces 19 s for 6 iterations) is not broken down yet.
 - **Host-side work left in the forces:** two-centre derivatives (0.32 s at 64 atoms) are now the largest stage.
 - **Meta-GGA XC on the host:** Libxc meta-GGA still runs on the host, now threaded (D-047).
 - **Plan limits:** `int32` value offsets cap a grid plan at 2^31 orbital values (about 2800 Si atoms); the host plan

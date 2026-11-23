@@ -272,5 +272,8 @@
   host Libxc; cheaper shift lookups in the pattern builder.
 - 64-atom single point on the laptop: 84.3 s -> 38.9 s (second geometry 65.9 s -> 37.8 s), energies equal to 12
   decimals; component outputs bitwise identical; 57 SCF/forces/symmetry tests pass; CUDA + Libxc build compiles on
-  Snellius. A100 measurement pending.
+  Snellius.
+- A100 job 29629429 (`main` vs the branch on one node): 26 CUDA and compilation tests pass; Si 64 PBE 39.5 s -> 17.3 s
+  (9.7 s warm cache), second geometry 19.7 s -> 6.7 s; r2SCAN 50.3 s -> 15.7 s; Si 512 PBE 182 s -> 98 s (69 s warm),
+  second geometry 139 s -> 65 s; energies identical to 1e-12 Ha.
 
