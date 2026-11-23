@@ -103,3 +103,4 @@ then `siesta_mcp.py indexes/default/current/docs.db`) and run manifest-driven nu
 [docs/design/](docs/design/) holds the specification (`IMPLEMENTATION_PLAN.md`), the plan and report of the vendored
 tools (`PLAN.md`, `IMPLEMENTATION.md`), the evidence contract (`EVIDENCE.md`) and the GPU performance study with its
 assessment plan (`known_bottlenecks.md`, `bottleneck_assessment_plan.md`).
+# jsiesta
