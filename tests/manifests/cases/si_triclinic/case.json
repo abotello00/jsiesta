@@ -1,0 +1,45 @@
+{
+  "name": "si_triclinic_strained",
+  "species": [
+    "Si",
+    "Si"
+  ],
+  "positions_bohr": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      1.35,
+      1.4,
+      1.38
+    ]
+  ],
+  "k_grid": [
+    2,
+    2,
+    2
+  ],
+  "nspin": 1,
+  "xc": "PBE",
+  "dispersion": "none",
+  "mesh_cutoff_ry": 100.0,
+  "cell_columns_bohr": [
+    [
+      5.2,
+      0.2,
+      0.1
+    ],
+    [
+      0.35,
+      5.05,
+      0.25
+    ],
+    [
+      0.15,
+      0.4,
+      5.3
+    ]
+  ]
+}

@@ -1,0 +1,980 @@
+{
+  "schema_version": 1,
+  "status": "frozen",
+  "description": "Phase 0 frozen reference validation matrix spanning all required SIESTA archetypes (PSML-only)",
+  "covered_modules": [
+    "jax_siesta.core",
+    "jax_siesta.species",
+    "jax_siesta.scf",
+    "jax_siesta.observables",
+    "jax_siesta.io"
+  ],
+  "timeout_seconds": 300,
+  "environment": {
+    "OMP_NUM_THREADS": "1"
+  },
+  "baseline": {
+    "command": [
+      "{python}",
+      "{manifestdir}/../../jax_siesta/testing/run_case.py",
+      "--mode",
+      "baseline",
+      "{workdir}/case.json"
+    ],
+    "artifacts": [
+      "../../jax_siesta/testing/run_case.py"
+    ],
+    "identity": {
+      "build": "jsiesta-phase0-reference-contract",
+      "revision": "0.3.0-phase0"
+    }
+  },
+  "candidate": {
+    "command": [
+      "{python}",
+      "{manifestdir}/../../jax_siesta/testing/run_case.py",
+      "--mode",
+      "candidate",
+      "{workdir}/case.json"
+    ],
+    "artifacts": [
+      "../../jax_siesta/testing/run_case.py"
+    ],
+    "identity": {
+      "build": "jsiesta-candidate",
+      "revision": "0.3.0-phase0"
+    }
+  },
+  "cases": [
+    {
+      "name": "h2o_gamma_molecule",
+      "archetype": "gamma_molecule",
+      "input_dir": "cases/h2o_gamma",
+      "nspin": 1,
+      "psml": [
+        "H.psml",
+        "O.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[2][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[2][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[2][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        }
+      }
+    },
+    {
+      "name": "graphene_2d_slab",
+      "archetype": "2d_slab",
+      "input_dir": "cases/graphene_slab",
+      "nspin": 1,
+      "psml": [
+        "C.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        }
+      }
+    },
+    {
+      "name": "si_diamond_bulk_k",
+      "archetype": "k_bulk_semiconductor",
+      "input_dir": "cases/si_bulk",
+      "nspin": 1,
+      "psml": [
+        "Si.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        }
+      }
+    },
+    {
+      "name": "co_hcp_collinear",
+      "archetype": "k_metal_collinear",
+      "input_dir": "cases/co_hcp_collinear",
+      "nspin": 2,
+      "psml": [
+        "Co.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "total_spin_moment": {
+          "atol": 0.001,
+          "rtol": 0.0001,
+          "unit": "mu_B"
+        }
+      }
+    },
+    {
+      "name": "co_hcp_nc_aligned_canted",
+      "archetype": "k_metal_noncollinear",
+      "input_dir": "cases/co_hcp_nc",
+      "nspin": 4,
+      "psml": [
+        "Co.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "total_spin_moment": {
+          "atol": 0.001,
+          "rtol": 0.0001,
+          "unit": "mu_B"
+        }
+      }
+    },
+    {
+      "name": "co_hcp_soc",
+      "archetype": "k_metal_soc",
+      "input_dir": "cases/co_hcp_soc",
+      "nspin": 8,
+      "psml": [
+        "Co.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "total_spin_moment": {
+          "atol": 0.001,
+          "rtol": 0.0001,
+          "unit": "mu_B"
+        }
+      }
+    },
+    {
+      "name": "co_afm_crystal",
+      "archetype": "antiferromagnetic_crystal",
+      "input_dir": "cases/co_afm",
+      "nspin": 2,
+      "psml": [
+        "Co.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "total_spin_moment": {
+          "atol": 0.001,
+          "rtol": 0.0001,
+          "unit": "mu_B"
+        }
+      }
+    },
+    {
+      "name": "si_triclinic_strained",
+      "archetype": "strained_triclinic_cell",
+      "input_dir": "cases/si_triclinic",
+      "nspin": 1,
+      "psml": [
+        "Si.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        }
+      }
+    },
+    {
+      "name": "graphene_bilayer_dispersion",
+      "archetype": "dispersion_bilayer",
+      "input_dir": "cases/c_bilayer",
+      "nspin": 1,
+      "psml": [
+        "C.psml"
+      ],
+      "tolerances": {
+        "last_scf_free_e_ev": {
+          "atol": 0.002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "final_post_scf_free_e_ev": {
+          "atol": 0.0002,
+          "rtol": 1e-07,
+          "unit": "eV"
+        },
+        "forces[0][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[0][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[1][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[2][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[2][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[2][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[3][0]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[3][1]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "forces[3][2]": {
+          "atol": 0.0001,
+          "rtol": 1e-05,
+          "unit": "eV/Ang"
+        },
+        "stress[0][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[0][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[1][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][0]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][1]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        },
+        "stress[2][2]": {
+          "atol": 1e-05,
+          "rtol": 1e-05,
+          "unit": "eV/Ang^3"
+        }
+      }
+    }
+  ]
+}

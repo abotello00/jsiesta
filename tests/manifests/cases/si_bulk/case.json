@@ -1,0 +1,45 @@
+{
+  "name": "si_diamond_bulk_k",
+  "species": [
+    "Si",
+    "Si"
+  ],
+  "positions_bohr": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      2.565,
+      2.565,
+      2.565
+    ]
+  ],
+  "k_grid": [
+    3,
+    3,
+    3
+  ],
+  "nspin": 1,
+  "xc": "PBE",
+  "dispersion": "none",
+  "mesh_cutoff_ry": 120.0,
+  "cell_columns_bohr": [
+    [
+      0.0,
+      5.13,
+      5.13
+    ],
+    [
+      5.13,
+      0.0,
+      5.13
+    ],
+    [
+      5.13,
+      5.13,
+      0.0
+    ]
+  ]
+}

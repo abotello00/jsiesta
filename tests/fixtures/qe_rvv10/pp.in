@@ -1,0 +1,6 @@
+&inputpp
+  prefix='bl', outdir='./tmp', plot_num=0, filplot='rho.pp'
+/
+&plot
+  iflag=3, output_format=6, fileout='rho.cube', nfile=1, filepp(1)='rho.pp', weight(1)=1.0
+/

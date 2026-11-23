@@ -1,0 +1,23 @@
+PROJECT_NAME           = "jsiesta C++/CUDA FFI"
+PROJECT_BRIEF          = "Compiled XLA FFI kernels for clean-room JAX + C++ static SIESTA"
+OUTPUT_DIRECTORY       = docs/_doxygen
+INPUT                  = cpp/include cpp/src cpp/cuda
+FILE_PATTERNS          = *.hpp *.h *.cpp *.cuh *.cu
+EXTENSION_MAPPING      = cuh=C++ cu=C++
+RECURSIVE              = YES
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = YES
+JAVADOC_AUTOBRIEF      = YES
+BUILTIN_STL_SUPPORT    = YES
+ALIASES                = "par=@par"

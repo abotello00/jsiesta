@@ -1,0 +1,44 @@
+[project]
+name = "jsiesta"
+version = "0.1.0"
+description = "Clean-room JAX + C++ static SIESTA Kohn-Sham DFT engine with native symmetry, auto-docs, and progressive knowledge graph"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1,<2",
+    "jax>=0.4.38",
+    "jaxlib>=0.4.38",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "spglib>=2.6",
+    "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+dispersion = ["dftd3>=1.7"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["knowledge", "index_docs", "rebuild_index", "siesta_mcp", "validation"]
+
+[tool.setuptools.packages.find]
+include = ["jax_siesta*", "kg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# record_property (residuals for the knowledge graph) works with xunit2 in practice; pytest only warns.
+filterwarnings = ["ignore:record_property is incompatible:pytest.PytestWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.mypy]
+files = ["jax_siesta", "kg"]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_redundant_casts = true
+no_implicit_optional = true

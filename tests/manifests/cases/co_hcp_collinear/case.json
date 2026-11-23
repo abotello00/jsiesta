@@ -1,0 +1,57 @@
+{
+  "name": "co_hcp_collinear",
+  "species": [
+    "Co",
+    "Co"
+  ],
+  "positions_bohr": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      2.365,
+      1.365,
+      3.845
+    ]
+  ],
+  "initial_moments": [
+    [
+      0.0,
+      0.0,
+      1.7
+    ],
+    [
+      0.0,
+      0.0,
+      1.7
+    ]
+  ],
+  "k_grid": [
+    4,
+    4,
+    3
+  ],
+  "nspin": 2,
+  "xc": "PBE",
+  "dispersion": "none",
+  "mesh_cutoff_ry": 120.0,
+  "cell_columns_bohr": [
+    [
+      4.73,
+      -2.365,
+      0.0
+    ],
+    [
+      0.0,
+      4.096,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      7.69
+    ]
+  ]
+}

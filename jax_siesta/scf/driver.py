@@ -1,0 +1,534 @@
+r"""Static KS-DFT SCF loop driver with ``scf_params`` adaptive control and symmetry hooks.
+
+Theory:
+    Executes the self-consistent Kohn-Sham fixed-point loop on a uniform 3D
+    real-space mesh and sparse NAO basis:
+
+    1. Assemble :math:`H(\mathbf{R}) = H_0 + H_{\text{grid}}[D_{\text{in}}]`
+    2. Solve :math:`H(\mathbf{k})C = S(\mathbf{k})C\varepsilon` across k-points
+    3. Build output density matrix :math:`D_{\text{out}}` and energy-density matrix :math:`E_{\text{out}}`
+    4. Optional native symmetry projection :math:`D_{\text{out}} \leftarrow \mathcal{P}_{\text{sym}}(D_{\text{out}})`
+    5. Evaluate residuals, adaptive trust-region / smearing controller, and mix
+    6. Scatter :math:`\rho(\mathbf{r}) = \text{rhoofd}(D)` and optional grid symmetrization
+    7. Solve Poisson (:math:`V_H`) + XC (:math:`V_{\text{xc}}`) + rVV10 + :math:`V^{\text{NA}}` and gather :math:`H_{\text{grid}}`
+
+Algorithm:
+    Purely functional state loop over ``SCFState`` with zero global state. Supports
+    both Hamiltonian mixing (default) and density-matrix mixing, plus optional
+    ``SymmetryProjector`` hooks for Phase 2.
+
+Invariants:
+    - Records ``last_scf_free_e_ha`` separately from the mandatory post-SCF ``DM_out`` pass.
+    - Guarantees exact user target ``electronic_temp_ha`` upon convergence.
+
+SIESTA Mapping:
+    Replaces ``siesta_forces.F``, ``scfconvergence_test.F``, and ``m_compute_dm.F90``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from jax_siesta.core.protocols import SymmetryProjector
+from jax_siesta.core.types import (
+    BasisData,
+    KPointMesh,
+    SCFConfig,
+    SCFState,
+    SparsePattern,
+    Structure,
+    TwoCenterMatrices,
+)
+from jax_siesta.grid.mesh import (
+    GridOps,
+    _pack_basis_grid_buffers,
+    choose_mesh_dimensions,
+    rhoofd_differentiable,
+    tauofd_differentiable,
+    vmat_differentiable,
+    vmat_tau_differentiable,
+)
+from jax_siesta.scf.controller import update_adaptive_state
+from jax_siesta.scf.descriptors import recommend_scf_defaults
+from jax_siesta.scf.eigensolver import GeneralizedEigenSolver
+from jax_siesta.scf.mixer import TikhonovPulayMixer
+from jax_siesta.xc.dispersion import RVV10Dispersion
+from jax_siesta.xc.functional import LibxcFFIEvaluator
+
+
+def build_monkhorst_pack_mesh(
+    grid_shape: tuple[int, int, int],
+    shifts: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> KPointMesh:
+    r"""Construct an unreduced uniform Monkhorst-Pack Brillouin-zone mesh.
+
+    Theory:
+        Generates fractional wavevectors :math:`k_\alpha = (i_\alpha + s_\alpha)/N_\alpha`
+        folded into :math:`(-1/2, 1/2]` with uniform weights :math:`w_q = 1 / (N_1 N_2 N_3)`.
+
+    Algorithm:
+        Cartesian product of 1D uniform fractional grids.
+
+    Parameters:
+        grid_shape: Tuple ``(nk1, nk2, nk3)`` of positive integers.
+        shifts: Fractional grid offsets in ``[0, 1)``.
+
+    Returns:
+        ``KPointMesh`` with ``is_ibz=False``.
+
+    Invariants:
+        ``sum(weights) == 1.0``.
+
+    SIESTA Mapping:
+        Replaces unreduced Monkhorst-Pack setup in ``kpoint_grid.F90``.
+    """
+    axes = []
+    for n, sh in zip(grid_shape, shifts, strict=True):
+        pts = (np.arange(n, dtype=np.float64) + sh) / float(n)
+        pts = pts - np.round(pts)
+        axes.append(pts)
+    g0, g1, g2 = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+    kpts = np.stack([g0.ravel(), g1.ravel(), g2.ravel()], axis=-1)
+    n_k = kpts.shape[0]
+    weights = np.full((n_k,), 1.0 / float(n_k), dtype=np.float64)
+    return KPointMesh(
+        kpoints_frac=jnp.asarray(kpts, dtype=jnp.float64),
+        weights=jnp.asarray(weights, dtype=jnp.float64),
+        grid_shape=grid_shape,
+        shifts=shifts,
+        is_ibz=False,
+        used_time_reversal=False,
+    )
+
+
+def _trace_dm_h(dm: jax.Array, h: jax.Array, nspin: int) -> jax.Array:
+    """Spin-resolved ``Tr[D H]`` over the sparse edges (real parts; off-diagonal spin blocks count twice)."""
+    if nspin in (4, 8):
+        return jnp.sum(
+            jnp.real(dm[0]) * jnp.real(h[0])
+            + jnp.real(dm[1]) * jnp.real(h[1])
+            + 2.0 * (jnp.real(dm[2]) * jnp.real(h[2]) + jnp.real(dm[3]) * jnp.real(h[3]))
+        )
+    if nspin == 2:
+        return jnp.sum(jnp.real(dm) * jnp.real(h))
+    return jnp.sum(jnp.real(dm[0]) * jnp.real(h[0]))
+
+
+def build_h0_sparse(two_center: TwoCenterMatrices, nspin: int) -> jax.Array:
+    r"""Assemble the geometry-dependent core Hamiltonian :math:`H_0 = T + V^{\text{KB}}`.
+
+    Theory:
+        Combines kinetic energy :math:`T_{\mu\nu}` and Kleinman-Bylander nonlocal
+        projectors :math:`V^{\text{KB}}_{\mu\nu}` across the spin channels
+        (including :math:`V^{\text{KB}}_{\text{SO}}` for ``nspin=8``).
+
+    Algorithm:
+        Broadcasts scalar ``T + V_kb`` to diagonal spin channels ``(uu, dd)`` and
+        adds complex spin-orbit couplings when ``nspin == 8``.
+
+    Parameters:
+        two_center: ``TwoCenterMatrices`` PyTree.
+        nspin: Spin mode ``1, 2, 4, 8``.
+
+    Returns:
+        Sparse array of shape ``(n_spin_mat, n_edges)`` (float64 for ``nspin<=4``,
+        float64 real/imag components packed into 4 channels for ``nspin=8`` when
+        ``v_kb_so`` real/imag are used — wait: ``(4, n_edges)`` complex128 if SOC
+        imaginary diagonal exists).
+
+    Invariants:
+        Preserves Hermiticity across ``transpose_edge_idx``.
+
+    SIESTA Mapping:
+        Replaces ``H0`` construction in ``setup_H0.F``.
+    """
+    h0_scalar = two_center.kinetic + two_center.v_kb
+    if nspin == 1:
+        return h0_scalar[None, :]
+    if nspin == 2:
+        return jnp.stack([h0_scalar, h0_scalar], axis=0)
+    if nspin == 4 or two_center.v_kb_so is None:
+        zeros = jnp.zeros_like(h0_scalar)
+        return jnp.stack([h0_scalar, h0_scalar, zeros, zeros], axis=0)
+
+    # nspin == 8: v_kb_so has shape (4, n_edges) complex128 [uu, dd, ud, du]
+    # Pack as complex128 (4, n_edges) [H_uu, H_dd, Re(H_ud), Im(H_ud)] where H_uu, H_dd can be complex
+    t_c = two_center.kinetic.astype(jnp.complex128)
+    vso = two_center.v_kb_so
+    return jnp.stack([t_c + vso[0], t_c + vso[1], jnp.real(vso[2]).astype(jnp.complex128), jnp.imag(vso[2]).astype(jnp.complex128)], axis=0)
+
+
+def _initial_dm_and_h_grid(
+    structure: Structure,
+    basis: BasisData,
+    pattern: SparsePattern,
+    two_center: TwoCenterMatrices,
+    kmesh: KPointMesh,
+    config: SCFConfig,
+    grid_ops: GridOps,
+    xc_eval: LibxcFFIEvaluator,
+    mesh_shape: tuple[int, int, int],
+    sym_proj: SymmetryProjector | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build cold-start DM from diagonalizing H_0 + V_NA + spin seed."""
+    n_edges = pattern.n_edges
+    n_electrons = basis.total_valence_electrons - config.net_charge
+
+    rho_na, v_na, rho_core = grid_ops.neutral_atom_grid(structure, basis, mesh_shape)
+    if sym_proj is not None:
+        rho_na = sym_proj.symmetrize_grid(rho_na[None, ...])[0]
+        v_na = sym_proj.symmetrize_grid(v_na[None, ...])[0]
+        rho_core = sym_proj.symmetrize_grid(rho_core[None, ...])[0]
+
+    # Seed neutral-atom density for initial V_xc[rho_NA] + V_NA
+    if config.nspin == 1:
+        rho_seed = rho_na[None, ...]
+    elif config.nspin == 2:
+        rho_seed = jnp.stack([0.5 * rho_na, 0.5 * rho_na], axis=0)
+    else:
+        rho_seed = jnp.stack([0.5 * rho_na, 0.5 * rho_na, jnp.zeros_like(rho_na), jnp.zeros_like(rho_na)], axis=0)
+
+    seed_eval = LibxcFFIEvaluator("PBE") if xc_eval.is_mgga else xc_eval
+    _, v_xc_0, _ = seed_eval.evaluate(rho_seed, structure.cell, config.nspin, rho_core, compute_stress=False)
+    v_eff_0 = v_xc_0.at[0].add(v_na)
+    if config.nspin >= 2:
+        v_eff_0 = v_eff_0.at[1].add(v_na)
+
+    # Apply tiny Zeeman breaking from initial_moments when spin-polarized
+    moments = np.asarray(structure.initial_moments, dtype=np.float64)
+    orb_atom = np.asarray(basis.orb_atom, dtype=np.int32)
+    h_seed = grid_ops.potential_to_matrix(v_eff_0, structure, basis, pattern, config.nspin)
+    h0 = build_h0_sparse(two_center, config.nspin)
+    h_init = h0 + h_seed
+
+    if config.nspin >= 2 and np.max(np.abs(moments)) > 1e-8:
+        # Add mild onsite spin splitting proportional to m_I on diagonal (mu==nu, T==0)
+        src = np.asarray(pattern.src_orb)
+        dst = np.asarray(pattern.dst_unit_orb)
+        sh = np.asarray(pattern.cell_shifts)[np.asarray(pattern.edge_cell_idx)]
+        is_diag0 = (src == dst) & np.all(sh == 0, axis=1)
+        s_vals = np.asarray(two_center.overlap)
+        b_scale = 0.04  # Ha/mu_B initial Zeeman seed
+        hz = np.zeros(n_edges, dtype=np.float64)
+        hx = np.zeros(n_edges, dtype=np.float64)
+        hy = np.zeros(n_edges, dtype=np.float64)
+        for e in np.where(is_diag0)[0]:
+            ia = int(orb_atom[src[e]])
+            mx, my, mz = moments[ia]
+            hz[e] = -b_scale * mz * s_vals[e]
+            hx[e] = -b_scale * mx * s_vals[e]
+            hy[e] = -b_scale * my * s_vals[e]
+        h_init = h_init.at[0].add(jnp.asarray(hz))
+        h_init = h_init.at[1].add(jnp.asarray(-hz))
+        if config.nspin in (4, 8):
+            h_init = h_init.at[2].add(jnp.asarray(hx))
+            h_init = h_init.at[3].add(jnp.asarray(-hy))
+
+    dm_0, _, _, _, _ = GeneralizedEigenSolver().solve(
+        h_init, two_center.overlap, pattern, kmesh, n_electrons, config.electronic_temp_ha, config.nspin
+    )
+    if sym_proj is not None:
+        dm_0 = sym_proj.project_matrix(dm_0, config.nspin)
+    return h_init, dm_0, rho_na, v_na
+
+
+def run_scf(
+    structure: Structure,
+    basis: BasisData,
+    pattern: SparsePattern,
+    two_center: TwoCenterMatrices,
+    kmesh: KPointMesh,
+    config: SCFConfig,
+    mesh_shape: tuple[int, int, int] | None = None,
+    sym_proj: SymmetryProjector | None = None,
+) -> tuple[SCFState, tuple[int, int, int]]:
+    r"""Execute the adaptive static SCF cycle until convergence or iteration cap.
+
+    Theory:
+        Solves the self-consistent Kohn-Sham fixed-point equations using
+        physics-informed ``scf_params`` conditioning defaults, Tikhonov-Pulay / Pulay
+        mixing with decoupled charge/spin preconditioning, native adaptive trust-region
+        backoff, and optional symmetry projection on ``D``, ``E``, and :math:`\rho(\mathbf{r})`.
+
+    Algorithm:
+        Initializes ``SCFState`` from a neutral-atom + Zeeman seed, iterates
+        ``solve -> symmetrize -> grid_potential -> residual -> controller -> mix``,
+        and returns the final ``SCFState`` holding unmixed ``dm_out`` and ``edm_out``.
+
+    Parameters:
+        structure: ``Structure`` PyTree.
+        basis: ``BasisData`` PyTree.
+        pattern: Static ``SparsePattern`` PyTree.
+        two_center: Precomputed ``TwoCenterMatrices``.
+        kmesh: ``KPointMesh`` PyTree.
+        config: ``SCFConfig`` hyperparameters.
+        mesh_shape: Optional explicit 3D mesh shape (defaults to ``choose_mesh_dimensions``).
+        sym_proj: Optional ``SymmetryProjector`` (used in Phase 2).
+
+    Returns:
+        Tuple ``(final_scf_state, mesh_shape)``.
+
+    Invariants:
+        - Never returns ``converged=True`` with ``active_temp_ha != config.electronic_temp_ha``.
+        - Enforces iteration >= 2 before convergence.
+
+    SIESTA Mapping:
+        Replaces the main SCF loop in ``siesta_forces.F``.
+    """
+    n_electrons = basis.total_valence_electrons - config.net_charge
+    if n_electrons <= 0.0 or structure.n_atoms == 0:
+        raise ValueError("Invalid electron count or empty structure.")
+
+    if mesh_shape is None:
+        mesh_shape = choose_mesh_dimensions(
+            structure.cell, config.mesh_cutoff_ry, criterion=config.mesh_criterion, mesh_subdivisions=config.mesh_subdivisions
+        )
+
+    rec = recommend_scf_defaults(structure, basis, config)
+    # The recommended Tikhonov lambda was computed but never reached the mixer (review M2).
+    mix_config = replace(config, tikhonov_reg=rec.tikhonov_reg)
+    grid_ops = GridOps()
+    xc_eval = LibxcFFIEvaluator(config.xc_functional)
+    rvv10 = RVV10Dispersion() if config.dispersion.upper() == "RVV10" else None
+    eigensolver = GeneralizedEigenSolver()
+    mixer = TikhonovPulayMixer()
+
+    # Compile eigensolver for the active static mesh/pattern/kmesh shape. S is fixed during the SCF, so its
+    # orthogonalising transform is computed once and passed in (an argument, not a closed-over constant).
+    s_transform = jax.jit(
+        lambda s_sparse: eigensolver.overlap_transform(s_sparse, pattern, kmesh, config.nspin)
+    )(two_center.overlap)
+
+    def _solve_step(h_mat: jax.Array, temp_val: float, s_x: jax.Array):
+        return eigensolver.solve(
+            h_mat, two_center.overlap, pattern, kmesh, n_electrons, temp_val, config.nspin, s_transform=s_x
+        )
+
+    solve_jit = jax.jit(_solve_step)
+
+    h0 = build_h0_sparse(two_center, config.nspin)
+    n_spin_mat = h0.shape[0]
+    n_edges = pattern.n_edges
+
+    h_init, dm_init, rho_na, v_na = _initial_dm_and_h_grid(
+        structure, basis, pattern, two_center, kmesh, config, grid_ops, xc_eval, mesh_shape, sym_proj
+    )
+    _, _, rho_core = grid_ops.neutral_atom_grid(structure, basis, mesh_shape)
+    tau_core = grid_ops.tau_core_grid(structure, basis, mesh_shape) if xc_eval.is_mgga else None
+    if sym_proj is not None:
+        rho_core = sym_proj.symmetrize_grid(rho_core[None, ...])[0]
+        if tau_core is not None:
+            tau_core = sym_proj.symmetrize_grid(tau_core[None, ...])[0]
+
+    n1, n2, n3 = mesh_shape
+    dvol = float(structure.volume) / float(n1 * n2 * n3)
+    packed_basis = _pack_basis_grid_buffers(basis, pattern)
+    positions_static = structure.positions
+    cell_static = structure.cell
+
+    # Evaluate initial Hamiltonian from dm_init (JIT-compiled for speed)
+    def _eval_h_grid_and_energy_raw(dm_mat: jax.Array):
+        dm_real = jnp.real(dm_mat) if jnp.iscomplexobj(dm_mat) else dm_mat
+        rho = rhoofd_differentiable(
+            dm_real, positions_static, cell_static, packed_basis, mesh_shape, config.nspin
+        )
+        if sym_proj is not None:
+            rho = sym_proj.symmetrize_grid(rho)
+        rho_tot = rho[0] if config.nspin == 1 else (rho[0] + rho[1])
+        delta_rho = rho_tot - rho_na
+        v_h, e_h, _ = grid_ops.hartree_potential(delta_rho, cell_static)
+        h_tau = None
+        if xc_eval.is_mgga:
+            tau = tauofd_differentiable(
+                dm_real, positions_static, cell_static, packed_basis, mesh_shape, config.nspin
+            )
+            if sym_proj is not None:
+                tau = sym_proj.symmetrize_grid(tau)
+            e_xc, v_xc, v_tau, _ = xc_eval.evaluate_mgga(
+                rho, tau, cell_static, config.nspin, rho_core, tau_core_grid=tau_core, compute_stress=False
+            )
+            if sym_proj is not None:
+                v_tau = sym_proj.symmetrize_grid(v_tau)
+            h_tau = vmat_tau_differentiable(
+                v_tau, positions_static, cell_static, packed_basis, n_edges, config.nspin
+            )
+        else:
+            e_xc, v_xc, _ = xc_eval.evaluate(rho, cell_static, config.nspin, rho_core, compute_stress=False)
+        v_eff = v_xc.at[0].add(v_na + v_h)
+        if config.nspin >= 2:
+            v_eff = v_eff.at[1].add(v_na + v_h)
+        e_disp = jnp.array(0.0, dtype=jnp.float64)
+        if rvv10 is not None:
+            e_disp, v_rvv, _ = rvv10.potential_and_energy(rho_tot + rho_core, cell_static, compute_stress=False)
+            v_eff = v_eff.at[0].add(v_rvv)
+            if config.nspin >= 2:
+                v_eff = v_eff.at[1].add(v_rvv)
+        if sym_proj is not None:
+            v_eff = sym_proj.symmetrize_grid(v_eff)
+        h_grid = vmat_differentiable(
+            v_eff, positions_static, cell_static, packed_basis, n_edges, config.nspin
+        )
+        if h_tau is not None:
+            h_grid = h_grid + h_tau
+        if sym_proj is not None:
+            h_grid = sym_proj.project_matrix(h_grid, config.nspin)
+        # Atomic part sum_IJ int V_NA,I n_J is exact in TwoCenterMatrices.e_na_pair (D-017).
+        e_v_na = dvol * jnp.sum((rho_tot - rho_na) * v_na)
+        e_v_eff_rho = dvol * (
+            jnp.sum(rho[0] * v_eff[0])
+            if config.nspin == 1
+            else (
+                jnp.sum(rho[0] * v_eff[0] + rho[1] * v_eff[1])
+                + (2.0 * jnp.sum(rho[2:4] * v_eff[2:4]) if config.nspin in (4, 8) else 0.0)
+            )
+        )
+        return h_grid, e_h, e_xc, e_disp, e_v_na, e_v_eff_rho
+
+    _eval_h_grid_and_energy = jax.jit(_eval_h_grid_and_energy_raw)
+
+    h_grid_0, e_h_0, e_xc_0, e_disp_0, e_v_na_0, _ = _eval_h_grid_and_energy(dm_init)
+    # Grid energy terms at the density D_in that built H_in: they enter the Harris-Foulkes energy (D-023).
+    e_grid_in = e_h_0 + e_xc_0 + e_disp_0 + e_v_na_0
+    harris_provenance = "exact_dm_mixing" if config.mix_target == "DM" else "siesta_h_mixing"
+    h_in = h0 + h_grid_0.astype(h0.dtype)
+    if sym_proj is not None:
+        h_in = sym_proj.project_matrix(h_in, config.nspin)
+
+    # Note for nspin=8, mixer works on real float64 channels while preserving imag(H_uu, H_dd) from H0_SO
+    h_so_imag = jnp.imag(h0[:2]) if jnp.iscomplexobj(h0) else None
+
+    n_mix_ch = 6 if (config.mix_target == "DM" and config.nspin in (4, 8)) else n_spin_mat
+    state = SCFState(
+        iteration=0,
+        h_sparse=h_in,
+        dm_in=dm_init,
+        dm_out=dm_init,
+        edm_out=jnp.zeros_like(dm_init),
+        fermi_level_ha=jnp.array(0.0, dtype=jnp.float64),
+        entropy_ha=jnp.array(0.0, dtype=jnp.float64),
+        last_scf_free_e_ha=jnp.array(0.0, dtype=jnp.float64),
+        w_cur=jnp.asarray(rec.w_base, dtype=jnp.float64),
+        w_base=jnp.asarray(rec.w_base, dtype=jnp.float64),
+        active_temp_ha=jnp.asarray(config.electronic_temp_ha, dtype=jnp.float64),
+        streak_bad=0,
+        prev_d_max=jnp.array(1.0, dtype=jnp.float64),
+        prev_h_max=jnp.array(1.0, dtype=jnp.float64),
+        history_x=jnp.zeros((rec.n_hist, n_mix_ch, n_edges), dtype=jnp.float64),
+        history_f=jnp.zeros((rec.n_hist, n_mix_ch, n_edges), dtype=jnp.float64),
+        history_count=0,
+        converged=False,
+        outcome="running",
+        history_d=jnp.zeros((rec.n_hist, n_mix_ch, n_edges), dtype=jnp.float64) if config.mixer_variant == "adiis" else None,
+        history_e=jnp.zeros((rec.n_hist,), dtype=jnp.float64) if config.mixer_variant == "adiis" else None,
+    )
+
+    prev_free_e = 0.0
+    dm_in = dm_init
+    h_cur = h_in
+
+    for _ in range(config.max_scf_iterations):
+        temp_cur = float(state.active_temp_ha)
+        dm_out, edm_out, mu_f, e_band, entropy = solve_jit(h_cur, temp_cur, s_transform)
+        if sym_proj is not None:
+            dm_out = sym_proj.project_matrix(dm_out, config.nspin)
+            edm_out = sym_proj.project_matrix(edm_out, config.nspin)
+
+        h_grid_out, e_h, e_xc, e_disp, e_v_na, e_v_eff_rho = _eval_h_grid_and_energy(dm_out)
+        h_out = h0 + h_grid_out.astype(h0.dtype)
+        if sym_proj is not None:
+            h_out = sym_proj.project_matrix(h_out, config.nspin)
+
+        # In-flight SCF Harris-like / KS free energy recorded as last_scf_free_e_ha:
+        # E_KS_inflight = E_band - Tr[D_out V_eff_in] + E_v_na + E_H + E_xc + E_disp + E_na_pair + entropy
+        # Wait: E_band = Tr[D_out (H0 + H_grid_in)], so E_band - Tr[D_out H_grid_out] + ...
+        h_grid_in = h_cur - h0
+        tr_in = _trace_dm_h(dm_out, h_grid_in, config.nspin)
+        free_e_scf = e_band - tr_in + e_v_na + e_h + e_xc + e_disp + two_center.e_na_pair + entropy
+        # Harris-Foulkes free energy E_KS[D_in] + Tr[H_in (D_out - D_in)] + entropy
+        #   = E_band[H_in] - Tr[D_in H_grid,in] + E_grid[D_in] + E_NA,pair - TS   (SIESTA compute_energies).
+        # Exact when H_in = H[D_in] (DM mixing). Under Hamiltonian mixing D_in is the previous D_out and H_in the
+        # mixed H, as in SIESTA; that value is not variational (harris_provenance records which one this is).
+        harris_e = (
+            e_band - _trace_dm_h(dm_in, h_grid_in, config.nspin) + e_grid_in + two_center.e_na_pair + entropy
+        )
+
+        d_max = float(jnp.max(jnp.abs(dm_out - dm_in)))
+        h_max = float(jnp.max(jnp.abs(h_out - h_cur)))
+        e_diff = abs(float(free_e_scf) - prev_free_e) if state.iteration > 0 else 1.0
+        prev_free_e = float(free_e_scf)
+
+        state, converged, outcome = update_adaptive_state(state, config, d_max, h_max, e_diff)
+        state = replace(
+            state,
+            h_sparse=h_cur,
+            dm_in=dm_in,
+            dm_out=dm_out,
+            edm_out=edm_out,
+            fermi_level_ha=mu_f,
+            entropy_ha=entropy,
+            last_scf_free_e_ha=free_e_scf,
+            harris_energy_ha=harris_e,
+            harris_provenance=harris_provenance,
+        )
+        if outcome == "numerical_breakdown":
+            return state, mesh_shape
+        if converged:
+            return state, mesh_shape
+
+        if config.mix_target == "Hamiltonian":
+            x_in_real = jnp.real(h_cur)
+            x_out_real = jnp.real(h_out)
+            adiis_aux = (jnp.real(dm_out), free_e_scf) if config.mixer_variant == "adiis" else None
+            x_next_real, state = mixer.step(x_in_real, x_out_real, state, mix_config, aux=adiis_aux)
+            if h_so_imag is not None:
+                h_next = x_next_real.astype(jnp.complex128)
+                h_next = h_next.at[:2].add(1j * h_so_imag)
+            else:
+                h_next = x_next_real
+            if sym_proj is not None:
+                h_next = sym_proj.project_matrix(h_next, config.nspin)
+            h_cur = h_next
+            dm_in = dm_out
+            e_grid_in = e_h + e_xc + e_disp + e_v_na
+        else:
+            if config.nspin in (4, 8):
+                # Pack [Re(uu), Re(dd), Re(ud), Im(ud), Im(uu), Im(dd)] so complex DM is mixed consistently
+                def _pack6(m: jax.Array) -> jax.Array:
+                    return jnp.stack(
+                        [
+                            jnp.real(m[0]),
+                            jnp.real(m[1]),
+                            jnp.real(m[2]),
+                            jnp.real(m[3]),
+                            jnp.imag(m[0]),
+                            jnp.imag(m[1]),
+                        ],
+                        axis=0,
+                    )
+
+                x_next6, state = mixer.step(_pack6(dm_in), _pack6(dm_out), state, mix_config)
+                x_next_dm = jnp.stack(
+                    [
+                        x_next6[0] + 1j * x_next6[4],
+                        x_next6[1] + 1j * x_next6[5],
+                        x_next6[2].astype(jnp.complex128),
+                        x_next6[3].astype(jnp.complex128),
+                    ],
+                    axis=0,
+                )
+            else:
+                x_next_dm, state = mixer.step(jnp.real(dm_in), jnp.real(dm_out), state, mix_config)
+            if sym_proj is not None:
+                x_next_dm = sym_proj.project_matrix(x_next_dm, config.nspin)
+            dm_in = x_next_dm.astype(dm_out.dtype)
+            h_grid_next, e_h_n, e_xc_n, e_disp_n, e_v_na_n, _ = _eval_h_grid_and_energy(dm_in)
+            e_grid_in = e_h_n + e_xc_n + e_disp_n + e_v_na_n
+            h_cur = h0 + h_grid_next.astype(h0.dtype)
+            if sym_proj is not None:
+                h_cur = sym_proj.project_matrix(h_cur, config.nspin)
+
+    return replace(state, converged=False, outcome="iteration_cap_exhausted"), mesh_shape

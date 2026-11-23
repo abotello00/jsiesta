@@ -1,0 +1,26 @@
+# External reference resources for cross-code tests.
+#
+# Every key is empty here: the locations are machine specific. Set them per machine in
+# tests/external_refs.local.toml (git-ignored, same [refs] table), or with an environment variable
+# JSIESTA_<KEY> (e.g. JSIESTA_SIESTA_BIN=/path/to/siesta). `~` is expanded to the user's home directory.
+# Tests that need a missing resource are skipped, or fail under `pytest --require-refs`.
+
+[refs]
+# Standard SIESTA executable (5.4.x).
+siesta_bin = ""
+# SIESTA built from the siesta_spglib_full_impl branch (native symmetry reference).
+siesta_sym_bin = ""
+# SIESTA built from the pr_mgga branch (meta-GGA, non-collinear, spin-orbit).
+siesta_mgga_bin = ""
+# SIESTA Tests/Pseudos directory (Si.tm2.nrl.psml, ...).
+siesta_pseudos_dir = ""
+# Tests directory of the pr_mgga SIESTA branch.
+pr_mgga_tests_dir = ""
+# PseudoDojo nc-sr-05 PBE standard set in PSML format (scalar relativistic).
+pseudodojo_sr_pbe_dir = ""
+# PseudoDojo nc-fr-04 PBE standard set in PSML format (fully relativistic).
+pseudodojo_fr_pbe_dir = ""
+# scf_params collinear hcp Co pilot run directory (Co.psml, .ion.xml, SIESTA outputs).
+co_pilot_dir = ""
+# SQLite documentation index of a SIESTA source tree (docs.db from rebuild_index.py; links code to SIESTA routines).
+siesta_doc_index = ""

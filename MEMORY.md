@@ -1,0 +1,74 @@
+# jsiesta Live Project Memory
+
+- **Repository:** `jsiesta`, branch `main`, version 0.1.0; consolidated release of the development repository
+  (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
+- **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
+  the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
+- **Last updated:** 2026-11-23
+- **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
+  Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
+  with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
+
+## Environment
+
+- `.venv` (Python 3.11) from `requirements-dev.txt`: jax/jaxlib 0.4.38, numpy 2.2.6, scipy 1.14.1, spglib 2.8.0,
+  mcp 1.27, sphinx 8.2.3, ruff 0.15.7, mypy 2.4.1, dftd3 1.7.0 (optional extra `[dispersion]`).
+- `make ffi` builds `cpp/build/libjsiesta_ffi` with static Libxc from `/opt/etsf` (`JSIESTA_USE_LIBXC=ON`).
+- External references: keys in `tests/external_refs.toml` (empty; set them in `tests/external_refs.local.toml` or `JSIESTA_<KEY>`):
+  standard SIESTA 5.4.2, `siesta_spglib_full_impl`, `pr_mgga` SIESTA, SIESTA `Tests/Pseudos`, `pr_mgga` Tests, the SIESTA documentation index,
+  scf_params Co pilot. Quantum ESPRESSO 7.5 was used once to freeze `tests/fixtures/qe_rvv10`.
+
+## Validation status (external references)
+
+- **Si bulk components, forces, stress (std + spglib SIESTA):** validated — `test_siesta_bulk_and_symmetry_parity` (matched meshes)
+- **Absolute total / free energy:** validated — `test_siesta_total_and_free_energy_parity` (Si, 3 geometries; ≤ 2 meV/cell)
+- **Co hcp collinear (nspin = 2, NLCC, semicore):** validated — `test_siesta_co_hcp_collinear_symmetry_parity` (components ≤ 2e-2 eV, F ≤ 1e-4 eV/Å, σ within 3e-3 eV/Å³; the 2.8 % σ_zz gap is the neutral-atom pair term: 57 % SIESTA's table error, 43 % a 0.075 % definitional difference, D-025)
+- **Neutral-atom pair energy:** vs the exact value of SIESTA's own formula — `tests/test_na_pair_exact.py` (D-025): PseudoDojo H2O/Si 0.05–0.07 % (SIESTA's printed `Ena` 0.3–2 % off, smooth table error); pilot Co −0.075 % (jsiesta, definitional) and +0.097 % (SIESTA), opposite directions
+- **Analytic stress terms = derivatives of their energies (fixed D, E):** validated — `tests/test_stress_components.py` (Si nspin 1; Co nspin 2 GGA and LDA with NLCC; ≤ 1e-9 Ha/Bohr³)
+- **meta-GGA / NC / SOC vs pr_mgga:** validated (unchanged tolerances) — `test_pr_mgga_si_bulk_noncol_and_soc_parity`
+- **DFT-D3(BJ):** validated — `tests/test_dispersion.py` (simple-dftd3 identity, FD, SIESTA energy/forces/stress)
+- **rVV10:** validated — `tests/test_dispersion.py` (QE E_nl to 3.5e-11 Ry, analytic kernel, FD stress)
+- **Forces/stress = derivatives of the energy:** validated — FD tests in `test_phase1_scf_and_forces.py`, `test_mgga_soc.py`
+- **GPU kernels:** validated against the CPU path (not against SIESTA) — `tests/test_phase3_cuda.py`, 24 of 24 on an A100 with Libxc (job 29610921): orbital–grid kernels and their adjoints on the cached plan (D-036 to D-038), device LDA/GGA XC matching Libxc to 1e-14 (D-039), plans resident, streamed, and streamed without pinning (D-042 to D-044)
+- **Tier B PAO generator:** partially — SZ/DZ/DZP radii and trends vs SIESTA (`test_basis_enthalpy.py`); absolute energies not compared
+- **Basis-enthalpy optimiser:** checked against SIESTA (D-040: same `PAO.Basis` in both codes, Si DZ; line minima within 0.05 Bohr, enthalpy curvatures within 3 %, 28 meV constant offset); pressure unit fixed (was 13.6x too small)
+- **Broyden / ADIIS mixers:** validated against model problems and Co hcp endpoint/trajectory test — `tests/test_mixers.py`, `test_si_bulk_and_co_hcp_spin_modes_and_mixer_endpoint_agreement` (D-022); no external reference exists; ADIIS is slower than Tikhonov-Pulay on all benchmark systems; GR-Pulay not implemented
+- **Harris energy:** validated against an independent recomputation, not against SIESTA — `tests/test_harris.py` (D-023); exact under DM mixing, SIESTA convention (non-variational) under Hamiltonian mixing
+- **Phase 0 matrix parity (H2O, graphene, triclinic Si, C bilayer, Co AFM) with PseudoDojo SR PBE:** validated with per-case tolerances — `test_phase0_matrix_parity_against_siesta` (energies ≤ 5 meV except triclinic Si 52 meV; forces ≤ 3e-4 eV/Å except H2O 0.06 and triclinic Si 0.1; the H2O and triclinic-Si force differences are SIESTA's table error in its neutral-atom pair term, D-025)
+- **SIESTA mesh criterion:** validated — `test_siesta_mesh_selection_matches_siesta` (15 cells, `criterion="siesta"`, D-020); the default since D-027 (`"jsiesta"` is the legacy option)
+- **Fully relativistic PSML below nspin 8:** validated — `test_fully_relativistic_psml_below_nspin8_matches_siesta` (H2O, triclinic Si; same projector set as SIESTA, D-028)
+- **Frozen spin axis (non-collinear GGA derivative):** bounded — `test_noncollinear_xc_derivative_with_frozen_spin_axis` (LDA exact, PBE <= 7e-5 relative on a spin spiral; D-026)
+- **KG verification status:** from JUnit results since D-019 (`make kg-results`); `resume_session_context` separates verified (external reference passed), self-consistent only, failing, skipped and never run
+
+## Upstream issues found (reported here, not fixed upstream)
+
+- SIESTA 5.4.2 `grimme_dispersion_m.F90`: `DFTD3.UseXCDefaults T` overwrites functional parameters with generic
+  defaults; D3 stress added with the wrong sign; bundled s-dftd3 1.1.0 gradient ~0.3 % off its energy (D-014).
+- `siesta_spglib_full_impl`: forces of symmetric structures are not symmetrised (1e-3 eV/Å residual in hcp Co).
+
+## Performance (A100 vs SIESTA, bulk Si, PBE; `docs/design/known_bottlenecks.md` Section 9)
+
+- SCF iteration 2.4–7.7x faster than SIESTA on 18 ranks and 1.5–3.0x faster than on 192 ranks (8–512 atoms).
+- Forces + stress 0.31–6.5 s (8–512 atoms): faster than SIESTA on 18 ranks from 64 atoms up, 2–4x slower than 192.
+- r2SCAN forces + stress at 512 atoms 14.8 s with the Hessian plan streamed from host memory (D-043, D-044).
+- Set-up and compilation dominate small cells: 7.7 s + 19 s at 64 atoms against 0.5 s for SIESTA's set-up.
+
+## Open issues
+
+- **Set-up and compilation cost:** two-centre set-up and the first SCF call (compilation) decide single points and MD
+  steps below about 200 atoms.
+- **Host-side work left in the forces:** two-centre derivatives (0.32 s at 64 atoms) are now the largest stage.
+- **Meta-GGA XC on the host:** Libxc meta-GGA still runs on the host (half the r2SCAN iteration).
+- **Plan limits:** `int32` value offsets cap a grid plan at 2^31 orbital values (about 2800 Si atoms); the host plan
+  must fit in host memory.
+- **SIESTA re-measurement:** SIESTA timings come from shared nodes with `DirectPhi .false.`; an exclusive-node run
+  with ELPA is still open.
+- **A100 reference replay:** the SIESTA-parity tests have not been replayed on the GPU against a reference cache
+  (`make refs-cache`).
+
+## Next steps
+
+1. Cut set-up and compilation cost (two-centre tables on the device, persistent compilation cache).
+2. Meta-GGA XC on the device; `vmat` without atomics.
+3. **Not done by choice:** adopting SIESTA's neutral-atom pair formula (D-025); GR-Pulay; a per-iteration Harris
+   comparison with SIESTA (needs SIESTA's diagonal atomic initial density matrix).

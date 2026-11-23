@@ -1,0 +1,45 @@
+{
+  "name": "graphene_2d_slab",
+  "species": [
+    "C",
+    "C"
+  ],
+  "positions_bohr": [
+    [
+      0.0,
+      0.0,
+      11.0
+    ],
+    [
+      2.325,
+      1.342,
+      11.0
+    ]
+  ],
+  "k_grid": [
+    4,
+    4,
+    1
+  ],
+  "nspin": 1,
+  "xc": "PBE",
+  "dispersion": "none",
+  "mesh_cutoff_ry": 120.0,
+  "cell_columns_bohr": [
+    [
+      4.65,
+      -2.325,
+      0.0
+    ],
+    [
+      0.0,
+      4.027,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      22.0
+    ]
+  ]
+}

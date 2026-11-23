@@ -1,0 +1,18 @@
+&control
+  calculation='scf', prefix='bl', outdir='./tmp', pseudo_dir='./', verbosity='high'
+/
+&system
+  ibrav=4, celldm(1)=4.6487, celldm(3)=6.0, nat=4, ntyp=1, ecutwfc=30.0, input_dft='rvv10'
+/
+&electrons
+  conv_thr=1e-9
+/
+ATOMIC_SPECIES
+C 12.011 C.UPF
+ATOMIC_POSITIONS angstrom
+C 0.000000 0.000000 5.825
+C 1.230000 0.710141 5.825
+C 1.230000 0.710141 9.175
+C 2.460000 1.420282 9.175
+K_POINTS automatic
+4 4 1 0 0 0

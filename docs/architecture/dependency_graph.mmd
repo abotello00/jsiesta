@@ -1,0 +1,79 @@
+flowchart LR
+    core["jax_siesta.core"]
+    core.ffi["jax_siesta.core.ffi"]
+    core --> core.ffi
+    core.protocols["jax_siesta.core.protocols"]
+    core --> core.protocols
+    core.types["jax_siesta.core.types"]
+    core --> core.types
+    grid["jax_siesta.grid"]
+    core --> grid
+    grid.mesh["jax_siesta.grid.mesh"]
+    core --> grid.mesh
+    integrals["jax_siesta.integrals"]
+    core --> integrals
+    integrals.two_center["jax_siesta.integrals.two_center"]
+    core --> integrals.two_center
+    io["jax_siesta.io"]
+    core --> io
+    io.fdf["jax_siesta.io.fdf"]
+    core --> io.fdf
+    observables["jax_siesta.observables"]
+    core --> observables
+    observables.forces["jax_siesta.observables.forces"]
+    core --> observables.forces
+    scf["jax_siesta.scf"]
+    core --> scf
+    scf.controller["jax_siesta.scf.controller"]
+    core --> scf.controller
+    scf.descriptors["jax_siesta.scf.descriptors"]
+    core --> scf.descriptors
+    scf.driver["jax_siesta.scf.driver"]
+    core --> scf.driver
+    scf.eigensolver["jax_siesta.scf.eigensolver"]
+    core --> scf.eigensolver
+    scf.mixer["jax_siesta.scf.mixer"]
+    core --> scf.mixer
+    species["jax_siesta.species"]
+    core --> species
+    species.basis_opt["jax_siesta.species.basis_opt"]
+    core --> species.basis_opt
+    species.pao_generator["jax_siesta.species.pao_generator"]
+    core --> species.pao_generator
+    species.psml["jax_siesta.species.psml"]
+    core --> species.psml
+    symmetry["jax_siesta.symmetry"]
+    core --> symmetry
+    symmetry.engine["jax_siesta.symmetry.engine"]
+    core --> symmetry.engine
+    symmetry.projection["jax_siesta.symmetry.projection"]
+    core --> symmetry.projection
+    symmetry.spacegroup["jax_siesta.symmetry.spacegroup"]
+    core --> symmetry.spacegroup
+    testing["jax_siesta.testing"]
+    core --> testing
+    testing.external_refs["jax_siesta.testing.external_refs"]
+    core --> testing.external_refs
+    testing.parity_html["jax_siesta.testing.parity_html"]
+    core --> testing.parity_html
+    testing.profile_phase3["jax_siesta.testing.profile_phase3"]
+    core --> testing.profile_phase3
+    testing.run_case["jax_siesta.testing.run_case"]
+    core --> testing.run_case
+    testing.siesta_adapter["jax_siesta.testing.siesta_adapter"]
+    core --> testing.siesta_adapter
+    testing.siesta_na_reference["jax_siesta.testing.siesta_na_reference"]
+    core --> testing.siesta_na_reference
+    testing.strain_fd["jax_siesta.testing.strain_fd"]
+    core --> testing.strain_fd
+    xc["jax_siesta.xc"]
+    core --> xc
+    xc.dispersion["jax_siesta.xc.dispersion"]
+    core --> xc.dispersion
+    xc.functional["jax_siesta.xc.functional"]
+    core --> xc.functional
+    cpp_ffi["cpp/libjsiesta_ffi"]
+    core --> cpp_ffi
+    grid --> cpp_ffi
+    xc --> cpp_ffi
+    integrals --> cpp_ffi

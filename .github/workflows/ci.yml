@@ -1,0 +1,87 @@
+# Continuous integration: lint and type checks, documentation build, and publication of the documentation on
+# GitHub Pages (main only). The physics tests need the C++/CUDA library, Libxc and external SIESTA references, so
+# they run locally with `make check` (see README.md).
+#
+# One-time repository setting: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  DOXYGEN_VERSION: "1.18.0"   # same release as the development machines; the Doxyfile treats warnings as errors
+
+jobs:
+  checks:
+    name: ruff and mypy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        # dftd3 is an optional extra (imported lazily) and is not needed for these checks
+        run: |
+          grep -v '^dftd3==' requirements-dev.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-ci.txt"
+      - run: python -m ruff check .
+      - run: python -m mypy
+
+  docs:
+    name: Doxygen + Sphinx
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install Python dependencies
+        run: |
+          grep -v '^dftd3==' requirements-dev.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install -r "$RUNNER_TEMP/requirements-ci.txt"
+      - name: Install Doxygen ${{ env.DOXYGEN_VERSION }}
+        run: |
+          tag="Release_${DOXYGEN_VERSION//./_}"
+          curl -fsSL "https://github.com/doxygen/doxygen/releases/download/${tag}/doxygen-${DOXYGEN_VERSION}.linux.bin.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/doxygen-${DOXYGEN_VERSION}/bin" >> "$GITHUB_PATH"
+      - name: Build documentation (warnings are errors)
+        run: |
+          doxygen --version
+          doxygen docs/Doxyfile > /dev/null
+          python -m sphinx -W -q -b html docs docs/_build/html
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+  deploy:
+    name: Publish to GitHub Pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [checks, docs]
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
