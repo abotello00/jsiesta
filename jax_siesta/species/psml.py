@@ -992,16 +992,19 @@ def build_sparse_pattern(
     # Guarantee Hermitian transpose closure (u, v, T) <-> (v, u, -T), then deduplicate
     a_mu = np.concatenate([e_mu, e_nu])
     a_nu = np.concatenate([e_nu, e_mu])
-    a_t = np.concatenate([e_t, -e_t], axis=0)
 
     # Shift table: the box shifts first (in their order), then any further shifts in sorted order
-    t_half = int(max(np.max(np.abs(a_t)) if a_t.size else 0, np.max(np.abs(box_shifts)))) + 1
+    t_half = int(max(np.max(np.abs(e_t)) if e_t.size else 0, np.max(np.abs(box_shifts)))) + 1
     t_stride = 2 * t_half + 1
 
     def _t_code(t: np.ndarray) -> np.ndarray:
         return ((t[:, 0] + t_half) * t_stride + (t[:, 1] + t_half)) * t_stride + (t[:, 2] + t_half)
 
-    used_codes = np.unique(_t_code(a_t)) if a_t.size else np.zeros(0, dtype=np.int64)
+    # Codes of all edges: those of the transposes follow from code(-T) = 2 t_half (s^2 + s + 1) - code(T).
+    n_codes = t_stride**3
+    e_code = _t_code(e_t) if e_t.size else np.zeros(0, dtype=np.int64)
+    a_code = np.concatenate([e_code, 2 * t_half * (t_stride * t_stride + t_stride + 1) - e_code])
+    used_codes = np.flatnonzero(np.bincount(a_code, minlength=n_codes)) if a_code.size else np.zeros(0, dtype=np.int64)
     box_codes = _t_code(box_shifts)
     extra_codes = np.setdiff1d(used_codes, box_codes)
     if extra_codes.size:
@@ -1014,9 +1017,11 @@ def build_sparse_pattern(
         shifts_list.extend((int(row[0]), int(row[1]), int(row[2])) for row in ex[ex_order])
     shifts_np = np.asarray(shifts_list, dtype=np.int64)
     all_codes = _t_code(shifts_np)
-    code_sort = np.argsort(all_codes)
     n_sh = len(shifts_list)
-    c_all = code_sort[np.searchsorted(all_codes[code_sort], _t_code(a_t))] if a_t.size else np.zeros(0, dtype=np.int64)
+    # Shift codes are small integers: a lookup table maps them to shift indices.
+    code_to_idx = np.full(n_codes, -1, dtype=np.int64)
+    code_to_idx[all_codes] = np.arange(n_sh, dtype=np.int64)
+    c_all = code_to_idx[a_code]
 
     # Sort by (src, shift index, dst) through one monotone key; dedupe
     keys = np.unique((a_mu * n_sh + c_all) * max(n_orb, 1) + a_nu)
@@ -1026,7 +1031,7 @@ def build_sparse_pattern(
 
     t_vecs = np.stack([cell @ np.asarray(t, dtype=np.float64) for t in shifts_list], axis=0)
     edge_vectors = (pos[orb_atom[dst_unit_orb]] + t_vecs[edge_cell_idx]) - pos[orb_atom[src_orb]]
-    neg_idx = code_sort[np.searchsorted(all_codes[code_sort], _t_code(-shifts_np))]
+    neg_idx = code_to_idx[_t_code(-shifts_np)]
     t_keys = (dst_unit_orb.astype(np.int64) * n_sh + neg_idx[edge_cell_idx]) * max(n_orb, 1) + src_orb
     transpose_idx = np.searchsorted(keys, t_keys).astype(np.int32)
     row_counts = np.bincount(src_orb, minlength=n_orb).astype(np.int32)

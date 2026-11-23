@@ -348,16 +348,18 @@ def _orb_grid_scatter_differentiable(
     def _scatter(dm_e: jax.Array, pos: jax.Array, c: jax.Array) -> jax.Array:
         return fwd_call(dm_e, pos, c, *static_args, n1=n1, n2=n2, n3=n3, nspin=nspin)
 
+    # The packed buffers travel as residuals, not through the closure, so the backward rule refers to no traced value
+    # of an enclosing jit (its pullback can then be returned from a compiled function).
     def _scatter_fwd(
         dm_e: jax.Array, pos: jax.Array, c: jax.Array
-    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
-        return _scatter(dm_e, pos, c), (dm_e, pos, c)
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array, tuple[jax.Array, ...]]]:
+        return _scatter(dm_e, pos, c), (dm_e, pos, c, static_args)
 
     def _scatter_bwd(
-        res: tuple[jax.Array, jax.Array, jax.Array], v_cot: jax.Array
+        res: tuple[jax.Array, jax.Array, jax.Array, tuple[jax.Array, ...]], v_cot: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        dm_e, pos, c = res
-        return bwd_call(dm_e, v_cot, pos, c, *static_args, n1=n1, n2=n2, n3=n3, nspin=nspin)
+        dm_e, pos, c, stat = res
+        return bwd_call(dm_e, v_cot, pos, c, *stat, n1=n1, n2=n2, n3=n3, nspin=nspin)
 
     _scatter.defvjp(_scatter_fwd, _scatter_bwd)
     return _scatter(dm_edges, positions, cell)
@@ -509,11 +511,11 @@ def tau_core_grid_differentiable(
         return fwd_call(pos, c, *static_args, n1=n1, n2=n2, n3=n3)
 
     def _tc_fwd(pos: jax.Array, c: jax.Array):
-        return _tc(pos, c), (pos, c)
+        return _tc(pos, c), (pos, c, static_args)
 
-    def _tc_bwd(res: tuple[jax.Array, jax.Array], w_tc: jax.Array):
-        pos, c = res
-        return bwd_call(w_tc, pos, c, *static_args, n1=n1, n2=n2, n3=n3)
+    def _tc_bwd(res: tuple[jax.Array, jax.Array, tuple[jax.Array, ...]], w_tc: jax.Array):
+        pos, c, stat = res
+        return bwd_call(w_tc, pos, c, *stat, n1=n1, n2=n2, n3=n3)
 
     _tc.defvjp(_tc_fwd, _tc_bwd)
     return _tc(positions, cell)
@@ -584,12 +586,14 @@ def neutral_atom_grid_differentiable(
 
     def _na_fwd(pos: jax.Array, c: jax.Array):
         outs = _na(pos, c)
-        return outs, (pos, c)
+        return outs, (pos, c, static_args)
 
-    def _na_bwd(res: tuple[jax.Array, jax.Array], cotangents: tuple[jax.Array, jax.Array, jax.Array]):
-        pos, c = res
+    def _na_bwd(
+        res: tuple[jax.Array, jax.Array, tuple[jax.Array, ...]], cotangents: tuple[jax.Array, jax.Array, jax.Array]
+    ):
+        pos, c, stat = res
         wr, wv, wc = cotangents
-        return bwd_call(wr, wv, wc, pos, c, *static_args, n1=n1, n2=n2, n3=n3)
+        return bwd_call(wr, wv, wc, pos, c, *stat, n1=n1, n2=n2, n3=n3)
 
     _na.defvjp(_na_fwd, _na_bwd)
     return _na(positions, cell)

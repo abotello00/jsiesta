@@ -29,6 +29,7 @@
 #include "jsiesta/grid_xc_ffi.hpp"
 #include "jsiesta/grid_plan.hpp"
 #include "jsiesta/math_utils.hpp"
+#include "jsiesta/threading.hpp"
 #include "xla/ffi/api/ffi.h"
 
 #include <algorithm>
@@ -45,6 +46,10 @@
 namespace ffi = xla::ffi;
 
 namespace {
+
+using jsiesta::threading::run_threads;
+
+inline int resolve_num_threads(int64_t n_grid) { return jsiesta::threading::thread_count(n_grid, 512); }
 
 inline void mat3_inv(const double* a_col, double* inv_row_major, double& det_out) {
     // a_col is stored row-major in memory? Wait: Python/JAX (3, 3) array cell[alpha, j]
@@ -175,16 +180,21 @@ ActiveGridCache build_active_grid_cache(
     }
 
     // Two sweeps over the same loops: the first counts the entries of every grid point, the second writes them in
-    // place (same order as one sweep with a scatter, without a second copy of all entries in memory).
-    std::vector<int32_t> counts(n_grid, 0);
-    std::vector<int32_t> write_pos;
+    // place (same order as one sweep with a scatter, without a second copy of all entries in memory). Each thread
+    // takes a contiguous range of atoms with its own per-point counters; the counters of thread t become write
+    // positions after those of threads 0 .. t - 1, so the entries of a point keep the serial (atom-ascending) order.
     const int n_sh_all = (l_max_all + 1) * (l_max_all + 1);
+    const int n_thr = std::max(1, std::min(resolve_num_threads(n_grid), static_cast<int>(n_atoms)));
+    std::vector<std::vector<int32_t>> cnt(static_cast<size_t>(n_thr), std::vector<int32_t>(n_grid, 0));
+
+    auto sweep = [&](const bool fill, const int t) {
+    std::vector<int32_t>& pos_t = cnt[static_cast<size_t>(t)];
     std::vector<double> c_lm(n_sh_all);
     std::vector<double> dc_lm((need_grad || need_hess) ? 3 * n_sh_all : 1);
     std::vector<double> hc_lm(need_hess ? 9 * n_sh_all : 1);
-
-    auto sweep = [&](const bool fill) {
-    for (int32_t ia = 0; ia < n_atoms; ++ia) {
+    const int32_t a_lo = static_cast<int32_t>(static_cast<int64_t>(n_atoms) * t / n_thr);
+    const int32_t a_hi = static_cast<int32_t>(static_cast<int64_t>(n_atoms) * (t + 1) / n_thr);
+    for (int32_t ia = a_lo; ia < a_hi; ++ia) {
         const double rc_a = atom_max_rc[ia];
         if (rc_a <= 0.0 || atom_orbs[ia].empty()) continue;
 
@@ -232,7 +242,7 @@ ActiveGridCache build_active_grid_cache(
                     const int64_t p_idx = (static_cast<int64_t>(g0) * n2 + g1) * n3 + g2;
                     if (!fill) {
                         for (int32_t mu : atom_orbs[ia]) {
-                            if (r < orb_rcut[mu]) counts[p_idx] += 1;
+                            if (r < orb_rcut[mu]) pos_t[p_idx] += 1;
                         }
                         continue;
                     }
@@ -288,7 +298,7 @@ ActiveGridCache build_active_grid_cache(
                                 hzz = s_r * dz * dz * y_poly + g_over_r * (y_poly + 2.0 * dz * dcz) + g_val * hlm[8];
                             }
                         }
-                        cache.entries[static_cast<size_t>(write_pos[p_idx]++)] =
+                        cache.entries[static_cast<size_t>(pos_t[p_idx]++)] =
                             ActiveOrbEntry{mu, t0, t1, t2, phi, gx, gy, gz, hxx, hxy, hxz, hyy, hyz, hzz};
                     }
                 }
@@ -297,15 +307,19 @@ ActiveGridCache build_active_grid_cache(
     }
     };
 
-    sweep(false);
+    run_threads(n_thr, [&](int t) { sweep(false, t); });
     cache.grid_offsets.resize(n_grid + 1, 0);
     for (int64_t p = 0; p < n_grid; ++p) {
-        cache.grid_offsets[p + 1] = cache.grid_offsets[p] + counts[p];
+        int32_t running = cache.grid_offsets[p];
+        for (int t = 0; t < n_thr; ++t) {
+            const int32_t c = cnt[static_cast<size_t>(t)][p];
+            cnt[static_cast<size_t>(t)][p] = running;
+            running += c;
+        }
+        cache.grid_offsets[p + 1] = running;
     }
-    std::vector<int32_t>().swap(counts);
     cache.entries.resize(static_cast<size_t>(cache.grid_offsets[n_grid]));
-    write_pos = cache.grid_offsets;
-    sweep(true);
+    run_threads(n_thr, [&](int t) { sweep(true, t); });
     return cache;
 }
 
@@ -369,17 +383,6 @@ struct EdgeHashMap {
     }
 };
 
-inline int resolve_num_threads(int64_t n_grid) {
-    if (n_grid < 512) return 1;
-    // OMP_NUM_THREADS (as set by the job) up to the hardware thread count; otherwise at most 8 threads.
-    const unsigned hc = std::thread::hardware_concurrency();
-    const char* env = std::getenv("OMP_NUM_THREADS");
-    if (env != nullptr && env[0] != '\0') {
-        const int n = std::atoi(env);
-        if (n >= 1) return hc == 0 ? n : std::min(n, static_cast<int>(hc));
-    }
-    return hc == 0 ? 1 : static_cast<int>(std::min<unsigned>(hc, 8U));
-}
 
 struct GridAtomImage {
     int32_t atom;
@@ -698,56 +701,20 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
                     tmp_block_edges[bid].begin(), tmp_block_edges[bid].end());
             }
 
-            // Group active orbital entries per grid point by (atom, s0, s1, s2)
-            plan->grid_img_offsets.assign(static_cast<size_t>(plan->active.n_grid) + 1, 0);
+            // Group active orbital entries per grid point by (atom, s0, s1, s2). Two passes over the points, threaded
+            // over point ranges: the first counts the images and values of every point, so the per-image arrays are
+            // allocated once at their exact size; the second fills them at the prefix-sum offsets. Same output as a
+            // serial pass.
+            const int64_t n_pts = plan->active.n_grid;
             struct TempRef {
                 int32_t atom;
                 int32_t s0, s1, s2;
                 int32_t entry_idx;
             };
-            std::vector<TempRef> refs;
-            // Exact sizes first, so the per-image arrays are allocated once (growing them one image at a time can
-            // briefly need twice their final size). Within a grid point the entries of one atom image are
-            // consecutive (they come from one unwrapped grid index of one atom), so a scan counts the images.
-            {
-                size_t n_groups = 0, n_vals = 0;
-                for (int64_t p = 0; p < plan->active.n_grid; ++p) {
-                    const int32_t beg = plan->active.grid_offsets[p];
-                    const int32_t end = plan->active.grid_offsets[p + 1];
-                    for (int32_t idx = beg; idx < end; ++idx) {
-                        const auto& e = plan->active.entries[idx];
-                        if (idx == beg) {
-                            ++n_groups;
-                            n_vals += static_cast<size_t>(plan->atom_n_orbs[orb_atom[e.orb]]);
-                            continue;
-                        }
-                        const auto& q = plan->active.entries[idx - 1];
-                        if (orb_atom[e.orb] != orb_atom[q.orb] || e.s0 != q.s0 || e.s1 != q.s1 || e.s2 != q.s2) {
-                            ++n_groups;
-                            n_vals += static_cast<size_t>(plan->atom_n_orbs[orb_atom[e.orb]]);
-                        }
-                    }
-                }
-                plan->img_groups.reserve(n_groups);
-                plan->img_vals.reserve(n_vals);
-                if (need_grad) {
-                    plan->img_gx.reserve(n_vals);
-                    plan->img_gy.reserve(n_vals);
-                    plan->img_gz.reserve(n_vals);
-                }
-                if (need_hess) {
-                    for (auto* hv : {&plan->img_hxx, &plan->img_hxy, &plan->img_hxz,
-                                     &plan->img_hyy, &plan->img_hyz, &plan->img_hzz}) {
-                        hv->reserve(n_vals);
-                    }
-                }
-            }
-            size_t total_img_val_len = 0;
-            for (int64_t p = 0; p < plan->active.n_grid; ++p) {
+            auto sorted_refs = [&](int64_t p, std::vector<TempRef>& refs) {
                 const int32_t beg = plan->active.grid_offsets[p];
                 const int32_t end = plan->active.grid_offsets[p + 1];
                 refs.clear();
-                refs.reserve(static_cast<size_t>(end - beg));
                 for (int32_t idx = beg; idx < end; ++idx) {
                     const auto& e = plan->active.entries[idx];
                     refs.push_back({orb_atom[e.orb], e.s0, e.s1, e.s2, idx});
@@ -758,51 +725,102 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
                     if (x.s1 != y.s1) return x.s1 < y.s1;
                     return x.s2 < y.s2;
                 });
-                size_t k = 0;
-                while (k < refs.size()) {
-                    const int32_t at = refs[k].atom;
-                    const int32_t rs0 = refs[k].s0, rs1 = refs[k].s1, rs2 = refs[k].s2;
-                    const int32_t noa = plan->atom_n_orbs[at];
-                    const int32_t voff = static_cast<int32_t>(total_img_val_len);
-                    total_img_val_len += static_cast<size_t>(noa);
-                    plan->img_vals.resize(total_img_val_len, 0.0);
-                    if (need_grad) {
-                        plan->img_gx.resize(total_img_val_len, 0.0);
-                        plan->img_gy.resize(total_img_val_len, 0.0);
-                        plan->img_gz.resize(total_img_val_len, 0.0);
-                    }
-                    if (need_hess) {
-                        for (auto* hv : {&plan->img_hxx, &plan->img_hxy, &plan->img_hxz,
-                                         &plan->img_hyy, &plan->img_hyz, &plan->img_hzz}) {
-                            hv->resize(total_img_val_len, 0.0);
+            };
+            auto same_image = [](const TempRef& x, const TempRef& y) {
+                return x.atom == y.atom && x.s0 == y.s0 && x.s1 == y.s1 && x.s2 == y.s2;
+            };
+            const int n_thr_pts = resolve_num_threads(n_pts);
+            auto point_range = [&](int t, int64_t& p0, int64_t& p1) {
+                p0 = n_pts * t / n_thr_pts;
+                p1 = n_pts * (t + 1) / n_thr_pts;
+            };
+            std::vector<int64_t> grp_off(static_cast<size_t>(n_pts) + 1, 0), val_off(static_cast<size_t>(n_pts) + 1, 0);
+            run_threads(n_thr_pts, [&](int t) {
+                std::vector<TempRef> refs;
+                int64_t p0 = 0, p1 = 0;
+                point_range(t, p0, p1);
+                for (int64_t p = p0; p < p1; ++p) {
+                    sorted_refs(p, refs);
+                    int64_t ng = 0, nv = 0;
+                    for (size_t k = 0; k < refs.size(); ++k) {
+                        if (k == 0 || !same_image(refs[k], refs[k - 1])) {
+                            ++ng;
+                            nv += plan->atom_n_orbs[refs[k].atom];
                         }
                     }
-                    while (k < refs.size() && refs[k].atom == at &&
-                           refs[k].s0 == rs0 && refs[k].s1 == rs1 && refs[k].s2 == rs2) {
-                        const auto& e = plan->active.entries[refs[k].entry_idx];
-                        const int32_t idx_off = voff + plan->orb_local[e.orb];
-                        plan->img_vals[idx_off] = e.val;
-                        if (need_grad) {
-                            plan->img_gx[idx_off] = e.gx;
-                            plan->img_gy[idx_off] = e.gy;
-                            plan->img_gz[idx_off] = e.gz;
-                        }
-                        if (need_hess) {
-                            plan->img_hxx[idx_off] = e.hxx;
-                            plan->img_hxy[idx_off] = e.hxy;
-                            plan->img_hxz[idx_off] = e.hxz;
-                            plan->img_hyy[idx_off] = e.hyy;
-                            plan->img_hyz[idx_off] = e.hyz;
-                            plan->img_hzz[idx_off] = e.hzz;
-                        }
-                        ++k;
-                    }
-                    plan->img_groups.push_back({at, rs0, rs1, rs2, voff});
+                    grp_off[static_cast<size_t>(p) + 1] = ng;
+                    val_off[static_cast<size_t>(p) + 1] = nv;
                 }
-                plan->grid_img_offsets[p + 1] = static_cast<int32_t>(plan->img_groups.size());
+            });
+            for (int64_t p = 0; p < n_pts; ++p) {
+                grp_off[static_cast<size_t>(p) + 1] += grp_off[static_cast<size_t>(p)];
+                val_off[static_cast<size_t>(p) + 1] += val_off[static_cast<size_t>(p)];
+            }
+            const int64_t n_groups = grp_off[static_cast<size_t>(n_pts)];
+            const int64_t n_vals_tot = val_off[static_cast<size_t>(n_pts)];
+            constexpr int64_t kInt32Max = 2147483647;
+            if (n_groups > kInt32Max || n_vals_tot > kInt32Max) {
+                // image and value offsets are int32: keep the generic representation (entries are not freed)
+                plan->use_atom_blocks = false;
+            } else {
+                plan->grid_img_offsets.assign(static_cast<size_t>(n_pts) + 1, 0);
+                for (int64_t p = 0; p <= n_pts; ++p) {
+                    plan->grid_img_offsets[static_cast<size_t>(p)] = static_cast<int32_t>(grp_off[static_cast<size_t>(p)]);
+                }
+                const size_t nv = static_cast<size_t>(n_vals_tot);
+                plan->img_groups.resize(static_cast<size_t>(n_groups));
+                plan->img_vals.assign(nv, 0.0);
+                if (need_grad) {
+                    plan->img_gx.assign(nv, 0.0);
+                    plan->img_gy.assign(nv, 0.0);
+                    plan->img_gz.assign(nv, 0.0);
+                }
+                if (need_hess) {
+                    for (auto* hv : {&plan->img_hxx, &plan->img_hxy, &plan->img_hxz,
+                                     &plan->img_hyy, &plan->img_hyz, &plan->img_hzz}) {
+                        hv->assign(nv, 0.0);
+                    }
+                }
+                run_threads(n_thr_pts, [&](int t) {
+                    std::vector<TempRef> refs;
+                    int64_t p0 = 0, p1 = 0;
+                    point_range(t, p0, p1);
+                    for (int64_t p = p0; p < p1; ++p) {
+                        sorted_refs(p, refs);
+                        int64_t g = grp_off[static_cast<size_t>(p)];
+                        int64_t v = val_off[static_cast<size_t>(p)];
+                        size_t k = 0;
+                        while (k < refs.size()) {
+                            const TempRef head = refs[k];
+                            const int32_t voff = static_cast<int32_t>(v);
+                            while (k < refs.size() && same_image(refs[k], head)) {
+                                const auto& e = plan->active.entries[refs[k].entry_idx];
+                                const size_t idx_off = static_cast<size_t>(voff + plan->orb_local[e.orb]);
+                                plan->img_vals[idx_off] = e.val;
+                                if (need_grad) {
+                                    plan->img_gx[idx_off] = e.gx;
+                                    plan->img_gy[idx_off] = e.gy;
+                                    plan->img_gz[idx_off] = e.gz;
+                                }
+                                if (need_hess) {
+                                    plan->img_hxx[idx_off] = e.hxx;
+                                    plan->img_hxy[idx_off] = e.hxy;
+                                    plan->img_hxz[idx_off] = e.hxz;
+                                    plan->img_hyy[idx_off] = e.hyy;
+                                    plan->img_hyz[idx_off] = e.hyz;
+                                    plan->img_hzz[idx_off] = e.hzz;
+                                }
+                                ++k;
+                            }
+                            plan->img_groups[static_cast<size_t>(g)] = {head.atom, head.s0, head.s1, head.s2, voff};
+                            ++g;
+                            v += plan->atom_n_orbs[head.atom];
+                        }
+                    }
+                });
             }
             // The per-entry arrays are only read by the generic path (no atom blocks); free them.
-            std::vector<ActiveOrbEntry>().swap(plan->active.entries);
+            if (plan->use_atom_blocks) std::vector<ActiveOrbEntry>().swap(plan->active.entries);
         }
     }
 

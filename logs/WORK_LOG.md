@@ -262,3 +262,15 @@
   documentation index (now the external reference `siesta_doc_index`), and results staleness ignored a missing HEAD.
   `make check` in the release tree; one initial commit.
 
+### 2026-11-23 — Fixed costs: compilation and threaded host set-up (D-046, D-047) (Claude Code)
+- Measured on the laptop: a new geometry with unchanged shapes recompiled three SCF functions (closures over the
+  geometry); the first call made about 400 small eager compilations; the grid plan, two-centre integrals and host
+  Libxc were single-threaded.
+- D-046: module-level compiled SCF and force stages with the geometry as arguments, precomputed Bloch gather tables,
+  custom-derivative residuals instead of closures, compiled initial density matrix, opt-in persistent compilation cache.
+- D-047: shared threading header; threaded grid plan build (order-preserving), two-centre and KB-overlap integrals,
+  host Libxc; cheaper shift lookups in the pattern builder.
+- 64-atom single point on the laptop: 84.3 s -> 38.9 s (second geometry 65.9 s -> 37.8 s), energies equal to 12
+  decimals; component outputs bitwise identical; 57 SCF/forces/symmetry tests pass; CUDA + Libxc build compiles on
+  Snellius. A100 measurement pending.
+

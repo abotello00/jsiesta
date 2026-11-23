@@ -24,6 +24,7 @@
  */
 
 #include "jsiesta/grid_xc_ffi.hpp"
+#include "jsiesta/threading.hpp"
 #include "jsiesta/xc_semilocal.hpp"
 #include "xla/ffi/api/ffi.h"
 
@@ -32,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 #include <cstdint>
@@ -153,8 +155,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::DataType::F64>>()   // v_sigma (3, n_grid)
         .Ret<ffi::Buffer<ffi::DataType::F64>>()); // v_tau (2, n_grid)
 
-[[maybe_unused]] int evaluate_xc_libxc_impl(
+[[maybe_unused]] int evaluate_xc_libxc_range(
     int64_t n_grid,
+    int64_t stride,
     const double* r_ptr,
     const double* s_ptr,
     int64_t xc_id,
@@ -163,7 +166,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     double* vr_ptr,
     double* vs_ptr) {
 #ifndef JSIESTA_HAS_LIBXC
-    (void)n_grid; (void)r_ptr; (void)s_ptr;
+    (void)n_grid; (void)stride; (void)r_ptr; (void)s_ptr;
     (void)xc_id; (void)n_spin_pol;
     (void)e_ptr; (void)vr_ptr; (void)vs_ptr;
     return 1;
@@ -182,14 +185,14 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     std::vector<double> s_lib(static_cast<size_t>(n_grid) * n_sg, 0.0);
     for (int64_t p = 0; p < n_grid; ++p) {
         if (n_sp == 1) {
-            r_lib[p] = std::max(0.0, r_ptr[p] + r_ptr[n_grid + p]);
-            s_lib[p] = std::max(0.0, s_ptr[p] + 2.0 * s_ptr[n_grid + p] + s_ptr[2 * n_grid + p]);
+            r_lib[p] = std::max(0.0, r_ptr[p] + r_ptr[stride + p]);
+            s_lib[p] = std::max(0.0, s_ptr[p] + 2.0 * s_ptr[stride + p] + s_ptr[2 * stride + p]);
         } else {
             r_lib[2 * p] = std::max(0.0, r_ptr[p]);
-            r_lib[2 * p + 1] = std::max(0.0, r_ptr[n_grid + p]);
+            r_lib[2 * p + 1] = std::max(0.0, r_ptr[stride + p]);
             s_lib[3 * p] = std::max(0.0, s_ptr[p]);
-            s_lib[3 * p + 1] = s_ptr[n_grid + p];
-            s_lib[3 * p + 2] = std::max(0.0, s_ptr[2 * n_grid + p]);
+            s_lib[3 * p + 1] = s_ptr[stride + p];
+            s_lib[3 * p + 2] = std::max(0.0, s_ptr[2 * stride + p]);
         }
     }
 
@@ -208,32 +211,52 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     xc_func_end(&func_c);
 
     for (int64_t p = 0; p < n_grid; ++p) {
-        const double n_tot = r_ptr[p] + r_ptr[n_grid + p];
+        const double n_tot = r_ptr[p] + r_ptr[stride + p];
         if (n_tot <= 1e-14) {
             e_ptr[p] = 0.0;
-            vr_ptr[p] = vr_ptr[n_grid + p] = 0.0;
-            vs_ptr[p] = vs_ptr[n_grid + p] = vs_ptr[2 * n_grid + p] = 0.0;
+            vr_ptr[p] = vr_ptr[stride + p] = 0.0;
+            vs_ptr[p] = vs_ptr[stride + p] = vs_ptr[2 * stride + p] = 0.0;
         } else {
             e_ptr[p] = n_tot * (ex[p] + ec[p]);
             if (n_sp == 1) {
                 const double vr = vrx[p] + vrc[p];
                 const double vs = vsx[p] + vsc[p];
                 vr_ptr[p] = vr;
-                vr_ptr[n_grid + p] = vr;
+                vr_ptr[stride + p] = vr;
                 vs_ptr[p] = vs;
-                vs_ptr[n_grid + p] = 2.0 * vs;
-                vs_ptr[2 * n_grid + p] = vs;
+                vs_ptr[stride + p] = 2.0 * vs;
+                vs_ptr[2 * stride + p] = vs;
             } else {
                 vr_ptr[p] = vrx[2 * p] + vrc[2 * p];
-                vr_ptr[n_grid + p] = vrx[2 * p + 1] + vrc[2 * p + 1];
+                vr_ptr[stride + p] = vrx[2 * p + 1] + vrc[2 * p + 1];
                 vs_ptr[p] = vsx[3 * p] + vsc[3 * p];
-                vs_ptr[n_grid + p] = vsx[3 * p + 1] + vsc[3 * p + 1];
-                vs_ptr[2 * n_grid + p] = vsx[3 * p + 2] + vsc[3 * p + 2];
+                vs_ptr[stride + p] = vsx[3 * p + 1] + vsc[3 * p + 1];
+                vs_ptr[2 * stride + p] = vsx[3 * p + 2] + vsc[3 * p + 2];
             }
         }
     }
     return 0;
 #endif
+}
+
+// Points [lo, hi) per thread; each thread initialises its own Libxc handles (pointwise work, same results).
+int evaluate_xc_libxc_impl(
+    int64_t n_grid,
+    const double* r_ptr,
+    const double* s_ptr,
+    int64_t xc_id,
+    int64_t n_spin_pol,
+    double* e_ptr,
+    double* vr_ptr,
+    double* vs_ptr) {
+    std::atomic<int> rc{0};
+    jsiesta::threading::parallel_ranges(
+        n_grid, jsiesta::threading::thread_count(n_grid, 16384), [&](int, int64_t lo, int64_t hi) {
+            const int r = evaluate_xc_libxc_range(
+                hi - lo, n_grid, r_ptr + lo, s_ptr + lo, xc_id, n_spin_pol, e_ptr + lo, vr_ptr + lo, vs_ptr + lo);
+            if (r != 0) rc = r;
+        });
+    return rc.load();
 }
 
 }  // namespace
@@ -252,8 +275,12 @@ int evaluate_xc_libxc_host(
     return evaluate_xc_libxc_impl(n_grid, r_ptr, s_ptr, xc_id, n_spin_pol, e_ptr, vr_ptr, vs_ptr);
 }
 
-int evaluate_mgga_libxc_host(
+namespace {
+
+// Meta-GGA Libxc evaluation of one range of grid points (planar inputs with stride n_grid between spin components).
+int evaluate_mgga_libxc_range(
     int64_t n_grid,
+    int64_t stride,
     const double* r_ptr,
     const double* s_ptr,
     const double* t_ptr,
@@ -265,7 +292,7 @@ int evaluate_mgga_libxc_host(
     double* vs_ptr,
     double* vt_ptr) {
 #ifndef JSIESTA_HAS_LIBXC
-    (void)n_grid; (void)r_ptr; (void)s_ptr; (void)t_ptr;
+    (void)n_grid; (void)stride; (void)r_ptr; (void)s_ptr; (void)t_ptr;
     (void)x_id; (void)c_id; (void)n_spin_pol;
     (void)e_ptr; (void)vr_ptr; (void)vs_ptr; (void)vt_ptr;
     return 1;
@@ -281,17 +308,17 @@ int evaluate_mgga_libxc_host(
     std::vector<double> lapl_zero(np_sz * n_sp, 0.0);
     for (int64_t p = 0; p < n_grid; ++p) {
         if (n_sp == 1) {
-            r_lib[p] = std::max(0.0, r_ptr[p] + r_ptr[n_grid + p]);
-            s_lib[p] = std::max(0.0, s_ptr[p] + 2.0 * s_ptr[n_grid + p] + s_ptr[2 * n_grid + p]);
-            t_lib[p] = std::max(0.0, t_ptr[p] + t_ptr[n_grid + p]);
+            r_lib[p] = std::max(0.0, r_ptr[p] + r_ptr[stride + p]);
+            s_lib[p] = std::max(0.0, s_ptr[p] + 2.0 * s_ptr[stride + p] + s_ptr[2 * stride + p]);
+            t_lib[p] = std::max(0.0, t_ptr[p] + t_ptr[stride + p]);
         } else {
             r_lib[2 * p] = std::max(0.0, r_ptr[p]);
-            r_lib[2 * p + 1] = std::max(0.0, r_ptr[n_grid + p]);
+            r_lib[2 * p + 1] = std::max(0.0, r_ptr[stride + p]);
             s_lib[3 * p] = std::max(0.0, s_ptr[p]);
-            s_lib[3 * p + 1] = s_ptr[n_grid + p];
-            s_lib[3 * p + 2] = std::max(0.0, s_ptr[2 * n_grid + p]);
+            s_lib[3 * p + 1] = s_ptr[stride + p];
+            s_lib[3 * p + 2] = std::max(0.0, s_ptr[2 * stride + p]);
             t_lib[2 * p] = std::max(0.0, t_ptr[p]);
-            t_lib[2 * p + 1] = std::max(0.0, t_ptr[n_grid + p]);
+            t_lib[2 * p + 1] = std::max(0.0, t_ptr[stride + p]);
         }
     }
 
@@ -339,33 +366,59 @@ int evaluate_mgga_libxc_host(
     }
 
     for (int64_t p = 0; p < n_grid; ++p) {
-        const double n_tot = r_ptr[p] + r_ptr[n_grid + p];
+        const double n_tot = r_ptr[p] + r_ptr[stride + p];
         if (n_tot <= 1e-9) {
             e_ptr[p] = 0.0;
-            vr_ptr[p] = vr_ptr[n_grid + p] = 0.0;
-            vs_ptr[p] = vs_ptr[n_grid + p] = vs_ptr[2 * n_grid + p] = 0.0;
-            vt_ptr[p] = vt_ptr[n_grid + p] = 0.0;
+            vr_ptr[p] = vr_ptr[stride + p] = 0.0;
+            vs_ptr[p] = vs_ptr[stride + p] = vs_ptr[2 * stride + p] = 0.0;
+            vt_ptr[p] = vt_ptr[stride + p] = 0.0;
         } else {
             e_ptr[p] = n_tot * e_acc[p];
             if (n_sp == 1) {
-                vr_ptr[p] = vr_ptr[n_grid + p] = vr_acc[p];
+                vr_ptr[p] = vr_ptr[stride + p] = vr_acc[p];
                 vs_ptr[p] = vs_acc[p];
-                vs_ptr[n_grid + p] = 2.0 * vs_acc[p];
-                vs_ptr[2 * n_grid + p] = vs_acc[p];
-                vt_ptr[p] = vt_ptr[n_grid + p] = vt_acc[p];
+                vs_ptr[stride + p] = 2.0 * vs_acc[p];
+                vs_ptr[2 * stride + p] = vs_acc[p];
+                vt_ptr[p] = vt_ptr[stride + p] = vt_acc[p];
             } else {
                 vr_ptr[p] = vr_acc[2 * p];
-                vr_ptr[n_grid + p] = vr_acc[2 * p + 1];
+                vr_ptr[stride + p] = vr_acc[2 * p + 1];
                 vs_ptr[p] = vs_acc[3 * p];
-                vs_ptr[n_grid + p] = vs_acc[3 * p + 1];
-                vs_ptr[2 * n_grid + p] = vs_acc[3 * p + 2];
+                vs_ptr[stride + p] = vs_acc[3 * p + 1];
+                vs_ptr[2 * stride + p] = vs_acc[3 * p + 2];
                 vt_ptr[p] = vt_acc[2 * p];
-                vt_ptr[n_grid + p] = vt_acc[2 * p + 1];
+                vt_ptr[stride + p] = vt_acc[2 * p + 1];
             }
         }
     }
     return 0;
 #endif
+}
+
+}  // namespace
+
+int evaluate_mgga_libxc_host(
+    int64_t n_grid,
+    const double* r_ptr,
+    const double* s_ptr,
+    const double* t_ptr,
+    int64_t x_id,
+    int64_t c_id,
+    int64_t n_spin_pol,
+    double* e_ptr,
+    double* vr_ptr,
+    double* vs_ptr,
+    double* vt_ptr) {
+    // Points [lo, hi) per thread; each thread initialises its own Libxc handles (pointwise work, same results).
+    std::atomic<int> rc{0};
+    jsiesta::threading::parallel_ranges(
+        n_grid, jsiesta::threading::thread_count(n_grid, 16384), [&](int, int64_t lo, int64_t hi) {
+            const int r = evaluate_mgga_libxc_range(
+                hi - lo, n_grid, r_ptr + lo, s_ptr + lo, t_ptr + lo, x_id, c_id, n_spin_pol, e_ptr + lo, vr_ptr + lo,
+                vs_ptr + lo, vt_ptr + lo);
+            if (r != 0) rc = r;
+        });
+    return rc.load();
 }
 
 }  // namespace jsiesta

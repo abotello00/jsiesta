@@ -28,6 +28,8 @@ SIESTA Mapping:
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -46,15 +48,18 @@ from jax_siesta.core.types import (
 from jax_siesta.grid.mesh import (
     GridOps,
     _pack_basis_grid_buffers,
+    _pack_na_buffers,
     choose_mesh_dimensions,
+    neutral_atom_grid_differentiable,
     rhoofd_differentiable,
+    tau_core_grid_differentiable,
     tauofd_differentiable,
     vmat_differentiable,
     vmat_tau_differentiable,
 )
 from jax_siesta.scf.controller import update_adaptive_state
 from jax_siesta.scf.descriptors import recommend_scf_defaults
-from jax_siesta.scf.eigensolver import GeneralizedEigenSolver
+from jax_siesta.scf.eigensolver import AssemblyPlan, GeneralizedEigenSolver, bloch_assembly_plan
 from jax_siesta.scf.mixer import TikhonovPulayMixer
 from jax_siesta.xc.dispersion import RVV10Dispersion
 from jax_siesta.xc.functional import LibxcFFIEvaluator
@@ -162,78 +167,242 @@ def build_h0_sparse(two_center: TwoCenterMatrices, nspin: int) -> jax.Array:
     return jnp.stack([t_c + vso[0], t_c + vso[1], jnp.real(vso[2]).astype(jnp.complex128), jnp.imag(vso[2]).astype(jnp.complex128)], axis=0)
 
 
-def _initial_dm_and_h_grid(
-    structure: Structure,
-    basis: BasisData,
-    pattern: SparsePattern,
-    two_center: TwoCenterMatrices,
-    kmesh: KPointMesh,
-    config: SCFConfig,
-    grid_ops: GridOps,
-    xc_eval: LibxcFFIEvaluator,
+@partial(jax.jit, static_argnames=("mesh_shape", "nspin", "seed_functional", "with_tau_core", "n_edges", "sym"))
+def _seed_grids_and_hamiltonian(
+    positions: jax.Array,
+    cell: jax.Array,
+    packed_basis: dict[str, jax.Array],
+    na_packed: dict[str, jax.Array],
+    h0: jax.Array,
+    *,
     mesh_shape: tuple[int, int, int],
-    sym_proj: SymmetryProjector | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Build cold-start DM from diagonalizing H_0 + V_NA + spin seed."""
-    n_edges = pattern.n_edges
-    n_electrons = basis.total_valence_electrons - config.net_charge
+    nspin: int,
+    seed_functional: str,
+    with_tau_core: bool,
+    n_edges: int,
+    sym: _StaticByIdentity | None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """Neutral-atom grids, core densities and the seed Hamiltonian ``H0 + V[rho_NA]``, in one compiled call.
 
-    rho_na, v_na, rho_core = grid_ops.neutral_atom_grid(structure, basis, mesh_shape)
+    Returns ``(h_seed, rho_na, v_na, rho_core, tau_core)``; ``tau_core`` is ``None`` unless ``with_tau_core``.
+    """
+    sym_proj = sym.obj if sym is not None else None
+    rho_na, v_na, rho_core = neutral_atom_grid_differentiable(positions, cell, na_packed, mesh_shape)
+    tau_core = tau_core_grid_differentiable(positions, cell, na_packed, mesh_shape) if with_tau_core else None
     if sym_proj is not None:
         rho_na = sym_proj.symmetrize_grid(rho_na[None, ...])[0]
         v_na = sym_proj.symmetrize_grid(v_na[None, ...])[0]
         rho_core = sym_proj.symmetrize_grid(rho_core[None, ...])[0]
+        if tau_core is not None:
+            tau_core = sym_proj.symmetrize_grid(tau_core[None, ...])[0]
 
     # Seed neutral-atom density for initial V_xc[rho_NA] + V_NA
-    if config.nspin == 1:
+    if nspin == 1:
         rho_seed = rho_na[None, ...]
-    elif config.nspin == 2:
+    elif nspin == 2:
         rho_seed = jnp.stack([0.5 * rho_na, 0.5 * rho_na], axis=0)
     else:
         rho_seed = jnp.stack([0.5 * rho_na, 0.5 * rho_na, jnp.zeros_like(rho_na), jnp.zeros_like(rho_na)], axis=0)
-
-    seed_eval = LibxcFFIEvaluator("PBE") if xc_eval.is_mgga else xc_eval
-    _, v_xc_0, _ = seed_eval.evaluate(rho_seed, structure.cell, config.nspin, rho_core, compute_stress=False)
+    _, v_xc_0, _ = LibxcFFIEvaluator(seed_functional).evaluate(rho_seed, cell, nspin, rho_core, compute_stress=False)
     v_eff_0 = v_xc_0.at[0].add(v_na)
-    if config.nspin >= 2:
+    if nspin >= 2:
         v_eff_0 = v_eff_0.at[1].add(v_na)
+    h_seed = vmat_differentiable(v_eff_0, positions, cell, packed_basis, n_edges, nspin)
+    return h0 + h_seed, rho_na, v_na, rho_core, tau_core
 
-    # Apply tiny Zeeman breaking from initial_moments when spin-polarized
+
+def _zeeman_seed(
+    structure: Structure, basis: BasisData, pattern: SparsePattern, overlap: jax.Array, nspin: int
+) -> np.ndarray | None:
+    """On-site spin splitting ``-b m_I S_mumu`` (rows z, x, y) that seeds a magnetic SCF, or ``None`` without moments."""
     moments = np.asarray(structure.initial_moments, dtype=np.float64)
+    if nspin < 2 or np.max(np.abs(moments)) <= 1e-8:
+        return None
     orb_atom = np.asarray(basis.orb_atom, dtype=np.int32)
-    h_seed = grid_ops.potential_to_matrix(v_eff_0, structure, basis, pattern, config.nspin)
-    h0 = build_h0_sparse(two_center, config.nspin)
-    h_init = h0 + h_seed
+    src = np.asarray(pattern.src_orb)
+    dst = np.asarray(pattern.dst_unit_orb)
+    sh = np.asarray(pattern.cell_shifts)[np.asarray(pattern.edge_cell_idx)]
+    is_diag0 = (src == dst) & np.all(sh == 0, axis=1)
+    s_vals = np.asarray(overlap)
+    b_scale = 0.04  # Ha/mu_B initial Zeeman seed
+    out = np.zeros((3, pattern.n_edges), dtype=np.float64)
+    diag_edges = np.where(is_diag0)[0]
+    m_e = moments[orb_atom[src[diag_edges]]]  # (n_diag, 3): (mx, my, mz) of each diagonal edge's atom
+    out[0, diag_edges] = -b_scale * m_e[:, 2] * s_vals[diag_edges]
+    out[1, diag_edges] = -b_scale * m_e[:, 0] * s_vals[diag_edges]
+    out[2, diag_edges] = -b_scale * m_e[:, 1] * s_vals[diag_edges]
+    return out
 
-    if config.nspin >= 2 and np.max(np.abs(moments)) > 1e-8:
-        # Add mild onsite spin splitting proportional to m_I on diagonal (mu==nu, T==0)
-        src = np.asarray(pattern.src_orb)
-        dst = np.asarray(pattern.dst_unit_orb)
-        sh = np.asarray(pattern.cell_shifts)[np.asarray(pattern.edge_cell_idx)]
-        is_diag0 = (src == dst) & np.all(sh == 0, axis=1)
-        s_vals = np.asarray(two_center.overlap)
-        b_scale = 0.04  # Ha/mu_B initial Zeeman seed
-        hz = np.zeros(n_edges, dtype=np.float64)
-        hx = np.zeros(n_edges, dtype=np.float64)
-        hy = np.zeros(n_edges, dtype=np.float64)
-        for e in np.where(is_diag0)[0]:
-            ia = int(orb_atom[src[e]])
-            mx, my, mz = moments[ia]
-            hz[e] = -b_scale * mz * s_vals[e]
-            hx[e] = -b_scale * mx * s_vals[e]
-            hy[e] = -b_scale * my * s_vals[e]
-        h_init = h_init.at[0].add(jnp.asarray(hz))
-        h_init = h_init.at[1].add(jnp.asarray(-hz))
-        if config.nspin in (4, 8):
-            h_init = h_init.at[2].add(jnp.asarray(hx))
-            h_init = h_init.at[3].add(jnp.asarray(-hy))
 
-    dm_0, _, _, _, _ = GeneralizedEigenSolver().solve(
-        h_init, two_center.overlap, pattern, kmesh, n_electrons, config.electronic_temp_ha, config.nspin
+class _StaticByIdentity:
+    """Hashable-by-identity wrapper so an unhashable object (the symmetry engine) can be a static ``jit`` argument."""
+
+    __slots__ = ("obj",)
+
+    def __init__(self, obj: Any) -> None:
+        self.obj = obj
+
+    def __hash__(self) -> int:
+        return id(self.obj)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _StaticByIdentity) and other.obj is self.obj
+
+
+# The SCF's compiled functions live at module level and take everything that depends on the geometry as arguments,
+# so a new geometry with the same array shapes reuses the compiled code (and the persistent compilation cache can hit).
+# Only shapes, spin mode, functional, dispersion choice and the symmetry engine (by identity) are static.
+
+
+@partial(jax.jit, static_argnames=("nspin", "real_k"))
+def _overlap_transform_compiled(
+    s_sparse: jax.Array,
+    pattern: SparsePattern,
+    kmesh: KPointMesh,
+    plan: AssemblyPlan | None,
+    nspin: int,
+    real_k: bool,
+) -> jax.Array:
+    return GeneralizedEigenSolver().overlap_transform(
+        s_sparse, pattern, kmesh, nspin, assembly_plan=plan, real_k=real_k
     )
+
+
+@partial(jax.jit, static_argnames=("nspin", "real_k"))
+def _solve_compiled(
+    h_mat: jax.Array,
+    temp_val: jax.Array,
+    s_transform: jax.Array,
+    s_sparse: jax.Array,
+    pattern: SparsePattern,
+    kmesh: KPointMesh,
+    plan: AssemblyPlan | None,
+    n_electrons: jax.Array,
+    nspin: int,
+    real_k: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    return GeneralizedEigenSolver().solve(
+        h_mat,
+        s_sparse,
+        pattern,
+        kmesh,
+        n_electrons,
+        temp_val,
+        nspin,
+        s_transform=s_transform,
+        assembly_plan=plan,
+        real_k=real_k,
+    )
+
+
+@partial(jax.jit, static_argnames=("mesh_shape", "nspin", "xc_functional", "use_rvv10", "n_edges", "sym"))
+def _grid_hamiltonian_and_energies(
+    dm_mat: jax.Array,
+    positions: jax.Array,
+    cell: jax.Array,
+    packed_basis: dict[str, jax.Array],
+    rho_na: jax.Array,
+    v_na: jax.Array,
+    rho_core: jax.Array,
+    tau_core: jax.Array | None,
+    dvol: jax.Array,
+    *,
+    mesh_shape: tuple[int, int, int],
+    nspin: int,
+    xc_functional: str,
+    use_rvv10: bool,
+    n_edges: int,
+    sym: _StaticByIdentity | None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Grid Hamiltonian and grid energies of a density matrix: ``(h_grid, e_h, e_xc, e_disp, e_v_na, Tr[rho V_eff])``."""
+    grid_ops = GridOps()
+    xc_eval = LibxcFFIEvaluator(xc_functional)
+    rvv10 = RVV10Dispersion() if use_rvv10 else None
+    sym_proj = sym.obj if sym is not None else None
+    dm_real = jnp.real(dm_mat) if jnp.iscomplexobj(dm_mat) else dm_mat
+    rho = rhoofd_differentiable(dm_real, positions, cell, packed_basis, mesh_shape, nspin)
     if sym_proj is not None:
-        dm_0 = sym_proj.project_matrix(dm_0, config.nspin)
-    return h_init, dm_0, rho_na, v_na
+        rho = sym_proj.symmetrize_grid(rho)
+    rho_tot = rho[0] if nspin == 1 else (rho[0] + rho[1])
+    delta_rho = rho_tot - rho_na
+    v_h, e_h, _ = grid_ops.hartree_potential(delta_rho, cell)
+    h_tau = None
+    if xc_eval.is_mgga:
+        tau = tauofd_differentiable(dm_real, positions, cell, packed_basis, mesh_shape, nspin)
+        if sym_proj is not None:
+            tau = sym_proj.symmetrize_grid(tau)
+        e_xc, v_xc, v_tau, _ = xc_eval.evaluate_mgga(
+            rho, tau, cell, nspin, rho_core, tau_core_grid=tau_core, compute_stress=False
+        )
+        if sym_proj is not None:
+            v_tau = sym_proj.symmetrize_grid(v_tau)
+        h_tau = vmat_tau_differentiable(v_tau, positions, cell, packed_basis, n_edges, nspin)
+    else:
+        e_xc, v_xc, _ = xc_eval.evaluate(rho, cell, nspin, rho_core, compute_stress=False)
+    v_eff = v_xc.at[0].add(v_na + v_h)
+    if nspin >= 2:
+        v_eff = v_eff.at[1].add(v_na + v_h)
+    e_disp = jnp.array(0.0, dtype=jnp.float64)
+    if rvv10 is not None:
+        e_disp, v_rvv, _ = rvv10.potential_and_energy(rho_tot + rho_core, cell, compute_stress=False)
+        v_eff = v_eff.at[0].add(v_rvv)
+        if nspin >= 2:
+            v_eff = v_eff.at[1].add(v_rvv)
+    if sym_proj is not None:
+        v_eff = sym_proj.symmetrize_grid(v_eff)
+    h_grid = vmat_differentiable(v_eff, positions, cell, packed_basis, n_edges, nspin)
+    if h_tau is not None:
+        h_grid = h_grid + h_tau
+    if sym_proj is not None:
+        h_grid = sym_proj.project_matrix(h_grid, nspin)
+    # Atomic part sum_IJ int V_NA,I n_J is exact in TwoCenterMatrices.e_na_pair (D-017).
+    e_v_na = dvol * jnp.sum((rho_tot - rho_na) * v_na)
+    e_v_eff_rho = dvol * (
+        jnp.sum(rho[0] * v_eff[0])
+        if nspin == 1
+        else (
+            jnp.sum(rho[0] * v_eff[0] + rho[1] * v_eff[1])
+            + (2.0 * jnp.sum(rho[2:4] * v_eff[2:4]) if nspin in (4, 8) else 0.0)
+        )
+    )
+    return h_grid, e_h, e_xc, e_disp, e_v_na, e_v_eff_rho
+
+
+@partial(jax.jit, static_argnames=("nspin", "sym"))
+def _iteration_update(
+    h0: jax.Array,
+    h_cur: jax.Array,
+    h_grid_out: jax.Array,
+    dm_out: jax.Array,
+    dm_in: jax.Array,
+    e_band: jax.Array,
+    entropy: jax.Array,
+    e_v_na: jax.Array,
+    e_h: jax.Array,
+    e_xc: jax.Array,
+    e_disp: jax.Array,
+    e_grid_in: jax.Array,
+    e_na_pair: jax.Array,
+    *,
+    nspin: int,
+    sym: _StaticByIdentity | None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Bookkeeping of one SCF iteration: ``(h_out, free_e_scf, harris_e, d_max, h_max)``.
+
+    ``free_e_scf`` is the in-flight KS free energy ``E_band - Tr[D_out H_grid,in] + E_grid[D_out] + E_NA,pair - TS``;
+    ``harris_e`` the Harris-Foulkes free energy ``E_band[H_in] - Tr[D_in H_grid,in] + E_grid[D_in] + E_NA,pair - TS``
+    (SIESTA ``compute_energies``; exact when ``H_in = H[D_in]``, i.e. DM mixing, D-023).
+    """
+    h_out = h0 + h_grid_out.astype(h0.dtype)
+    if sym is not None:
+        h_out = sym.obj.project_matrix(h_out, nspin)
+    h_grid_in = h_cur - h0
+    tr_in = _trace_dm_h(dm_out, h_grid_in, nspin)
+    free_e_scf = e_band - tr_in + e_v_na + e_h + e_xc + e_disp + e_na_pair + entropy
+    harris_e = e_band - _trace_dm_h(dm_in, h_grid_in, nspin) + e_grid_in + e_na_pair + entropy
+    d_max = jnp.max(jnp.abs(dm_out - dm_in))
+    h_max = jnp.max(jnp.abs(h_out - h_cur))
+    return h_out, free_e_scf, harris_e, d_max, h_max
 
 
 def run_scf(
@@ -291,104 +460,88 @@ def run_scf(
     rec = recommend_scf_defaults(structure, basis, config)
     # The recommended Tikhonov lambda was computed but never reached the mixer (review M2).
     mix_config = replace(config, tikhonov_reg=rec.tikhonov_reg)
-    grid_ops = GridOps()
     xc_eval = LibxcFFIEvaluator(config.xc_functional)
     rvv10 = RVV10Dispersion() if config.dispersion.upper() == "RVV10" else None
-    eigensolver = GeneralizedEigenSolver()
     mixer = TikhonovPulayMixer()
 
-    # Compile eigensolver for the active static mesh/pattern/kmesh shape. S is fixed during the SCF, so its
-    # orthogonalising transform is computed once and passed in (an argument, not a closed-over constant).
-    s_transform = jax.jit(
-        lambda s_sparse: eigensolver.overlap_transform(s_sparse, pattern, kmesh, config.nspin)
-    )(two_center.overlap)
+    # S is fixed during the SCF, so its orthogonalising transform is computed once and passed to every solve. The
+    # assembly tables and the real-arithmetic flag come from the concrete pattern, once (see bloch_assembly_plan).
+    assembly_plan, real_k = bloch_assembly_plan(pattern, kmesh, config.nspin)
+    n_electrons_arr = jnp.asarray(n_electrons, dtype=jnp.float64)
+    s_transform = _overlap_transform_compiled(
+        two_center.overlap, pattern, kmesh, assembly_plan, nspin=config.nspin, real_k=real_k
+    )
 
-    def _solve_step(h_mat: jax.Array, temp_val: float, s_x: jax.Array):
-        return eigensolver.solve(
-            h_mat, two_center.overlap, pattern, kmesh, n_electrons, temp_val, config.nspin, s_transform=s_x
+    def solve_jit(h_mat: jax.Array, temp_val: float, s_x: jax.Array):  # type: ignore[no-untyped-def]
+        return _solve_compiled(
+            h_mat,
+            jnp.asarray(temp_val, dtype=jnp.float64),
+            s_x,
+            two_center.overlap,
+            pattern,
+            kmesh,
+            assembly_plan,
+            n_electrons_arr,
+            nspin=config.nspin,
+            real_k=real_k,
         )
-
-    solve_jit = jax.jit(_solve_step)
 
     h0 = build_h0_sparse(two_center, config.nspin)
     n_spin_mat = h0.shape[0]
     n_edges = pattern.n_edges
+    packed_basis = _pack_basis_grid_buffers(basis, pattern)
+    sym_static = _StaticByIdentity(sym_proj) if sym_proj is not None else None
 
-    h_init, dm_init, rho_na, v_na = _initial_dm_and_h_grid(
-        structure, basis, pattern, two_center, kmesh, config, grid_ops, xc_eval, mesh_shape, sym_proj
+    # Cold start: diagonalise H0 + V_xc[rho_NA] + V_NA (+ an on-site Zeeman seed for magnetic runs).
+    h_init, rho_na, v_na, rho_core, tau_core = _seed_grids_and_hamiltonian(
+        structure.positions,
+        structure.cell,
+        packed_basis,
+        _pack_na_buffers(structure, basis),
+        h0,
+        mesh_shape=tuple(int(x) for x in mesh_shape),
+        nspin=config.nspin,
+        seed_functional="PBE" if xc_eval.is_mgga else config.xc_functional,
+        with_tau_core=xc_eval.is_mgga,
+        n_edges=n_edges,
+        sym=sym_static,
     )
-    _, _, rho_core = grid_ops.neutral_atom_grid(structure, basis, mesh_shape)
-    tau_core = grid_ops.tau_core_grid(structure, basis, mesh_shape) if xc_eval.is_mgga else None
+    zeeman = _zeeman_seed(structure, basis, pattern, two_center.overlap, config.nspin)
+    if zeeman is not None:
+        h_init = h_init.at[0].add(jnp.asarray(zeeman[0]))
+        h_init = h_init.at[1].add(jnp.asarray(-zeeman[0]))
+        if config.nspin in (4, 8):
+            h_init = h_init.at[2].add(jnp.asarray(zeeman[1]))
+            h_init = h_init.at[3].add(jnp.asarray(-zeeman[2]))
+    dm_init = solve_jit(h_init, config.electronic_temp_ha, s_transform)[0]
     if sym_proj is not None:
-        rho_core = sym_proj.symmetrize_grid(rho_core[None, ...])[0]
-        if tau_core is not None:
-            tau_core = sym_proj.symmetrize_grid(tau_core[None, ...])[0]
+        dm_init = sym_proj.project_matrix(dm_init, config.nspin)
 
     n1, n2, n3 = mesh_shape
     dvol = float(structure.volume) / float(n1 * n2 * n3)
-    packed_basis = _pack_basis_grid_buffers(basis, pattern)
     positions_static = structure.positions
     cell_static = structure.cell
 
-    # Evaluate initial Hamiltonian from dm_init (JIT-compiled for speed)
-    def _eval_h_grid_and_energy_raw(dm_mat: jax.Array):
-        dm_real = jnp.real(dm_mat) if jnp.iscomplexobj(dm_mat) else dm_mat
-        rho = rhoofd_differentiable(
-            dm_real, positions_static, cell_static, packed_basis, mesh_shape, config.nspin
-        )
-        if sym_proj is not None:
-            rho = sym_proj.symmetrize_grid(rho)
-        rho_tot = rho[0] if config.nspin == 1 else (rho[0] + rho[1])
-        delta_rho = rho_tot - rho_na
-        v_h, e_h, _ = grid_ops.hartree_potential(delta_rho, cell_static)
-        h_tau = None
-        if xc_eval.is_mgga:
-            tau = tauofd_differentiable(
-                dm_real, positions_static, cell_static, packed_basis, mesh_shape, config.nspin
-            )
-            if sym_proj is not None:
-                tau = sym_proj.symmetrize_grid(tau)
-            e_xc, v_xc, v_tau, _ = xc_eval.evaluate_mgga(
-                rho, tau, cell_static, config.nspin, rho_core, tau_core_grid=tau_core, compute_stress=False
-            )
-            if sym_proj is not None:
-                v_tau = sym_proj.symmetrize_grid(v_tau)
-            h_tau = vmat_tau_differentiable(
-                v_tau, positions_static, cell_static, packed_basis, n_edges, config.nspin
-            )
-        else:
-            e_xc, v_xc, _ = xc_eval.evaluate(rho, cell_static, config.nspin, rho_core, compute_stress=False)
-        v_eff = v_xc.at[0].add(v_na + v_h)
-        if config.nspin >= 2:
-            v_eff = v_eff.at[1].add(v_na + v_h)
-        e_disp = jnp.array(0.0, dtype=jnp.float64)
-        if rvv10 is not None:
-            e_disp, v_rvv, _ = rvv10.potential_and_energy(rho_tot + rho_core, cell_static, compute_stress=False)
-            v_eff = v_eff.at[0].add(v_rvv)
-            if config.nspin >= 2:
-                v_eff = v_eff.at[1].add(v_rvv)
-        if sym_proj is not None:
-            v_eff = sym_proj.symmetrize_grid(v_eff)
-        h_grid = vmat_differentiable(
-            v_eff, positions_static, cell_static, packed_basis, n_edges, config.nspin
-        )
-        if h_tau is not None:
-            h_grid = h_grid + h_tau
-        if sym_proj is not None:
-            h_grid = sym_proj.project_matrix(h_grid, config.nspin)
-        # Atomic part sum_IJ int V_NA,I n_J is exact in TwoCenterMatrices.e_na_pair (D-017).
-        e_v_na = dvol * jnp.sum((rho_tot - rho_na) * v_na)
-        e_v_eff_rho = dvol * (
-            jnp.sum(rho[0] * v_eff[0])
-            if config.nspin == 1
-            else (
-                jnp.sum(rho[0] * v_eff[0] + rho[1] * v_eff[1])
-                + (2.0 * jnp.sum(rho[2:4] * v_eff[2:4]) if config.nspin in (4, 8) else 0.0)
-            )
-        )
-        return h_grid, e_h, e_xc, e_disp, e_v_na, e_v_eff_rho
+    dvol_arr = jnp.asarray(dvol, dtype=jnp.float64)
 
-    _eval_h_grid_and_energy = jax.jit(_eval_h_grid_and_energy_raw)
+    def _eval_h_grid_and_energy(dm_mat: jax.Array):  # type: ignore[no-untyped-def]
+        return _grid_hamiltonian_and_energies(
+            dm_mat,
+            positions_static,
+            cell_static,
+            packed_basis,
+            rho_na,
+            v_na,
+            rho_core,
+            tau_core,
+            dvol_arr,
+            mesh_shape=tuple(int(x) for x in mesh_shape),
+            nspin=config.nspin,
+            xc_functional=config.xc_functional,
+            use_rvv10=rvv10 is not None,
+            n_edges=n_edges,
+            sym=sym_static,
+        )
 
     h_grid_0, e_h_0, e_xc_0, e_disp_0, e_v_na_0, _ = _eval_h_grid_and_energy(dm_init)
     # Grid energy terms at the density D_in that built H_in: they enter the Harris-Foulkes energy (D-023).
@@ -438,26 +591,27 @@ def run_scf(
             edm_out = sym_proj.project_matrix(edm_out, config.nspin)
 
         h_grid_out, e_h, e_xc, e_disp, e_v_na, e_v_eff_rho = _eval_h_grid_and_energy(dm_out)
-        h_out = h0 + h_grid_out.astype(h0.dtype)
-        if sym_proj is not None:
-            h_out = sym_proj.project_matrix(h_out, config.nspin)
-
-        # In-flight SCF Harris-like / KS free energy recorded as last_scf_free_e_ha:
-        # E_KS_inflight = E_band - Tr[D_out V_eff_in] + E_v_na + E_H + E_xc + E_disp + E_na_pair + entropy
-        # Wait: E_band = Tr[D_out (H0 + H_grid_in)], so E_band - Tr[D_out H_grid_out] + ...
-        h_grid_in = h_cur - h0
-        tr_in = _trace_dm_h(dm_out, h_grid_in, config.nspin)
-        free_e_scf = e_band - tr_in + e_v_na + e_h + e_xc + e_disp + two_center.e_na_pair + entropy
-        # Harris-Foulkes free energy E_KS[D_in] + Tr[H_in (D_out - D_in)] + entropy
-        #   = E_band[H_in] - Tr[D_in H_grid,in] + E_grid[D_in] + E_NA,pair - TS   (SIESTA compute_energies).
-        # Exact when H_in = H[D_in] (DM mixing). Under Hamiltonian mixing D_in is the previous D_out and H_in the
-        # mixed H, as in SIESTA; that value is not variational (harris_provenance records which one this is).
-        harris_e = (
-            e_band - _trace_dm_h(dm_in, h_grid_in, config.nspin) + e_grid_in + two_center.e_na_pair + entropy
+        # In-flight KS and Harris-Foulkes free energies. Under Hamiltonian mixing D_in is the previous D_out and H_in
+        # the mixed H, as in SIESTA; that Harris value is not variational (harris_provenance records which one it is).
+        h_out, free_e_scf, harris_e, d_max_arr, h_max_arr = _iteration_update(
+            h0,
+            h_cur,
+            h_grid_out,
+            dm_out,
+            dm_in,
+            e_band,
+            entropy,
+            e_v_na,
+            e_h,
+            e_xc,
+            e_disp,
+            e_grid_in,
+            two_center.e_na_pair,
+            nspin=config.nspin,
+            sym=sym_static,
         )
-
-        d_max = float(jnp.max(jnp.abs(dm_out - dm_in)))
-        h_max = float(jnp.max(jnp.abs(h_out - h_cur)))
+        d_max = float(d_max_arr)
+        h_max = float(h_max_arr)
         e_diff = abs(float(free_e_scf) - prev_free_e) if state.iteration > 0 else 1.0
         prev_free_e = float(free_e_scf)
 

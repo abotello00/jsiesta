@@ -36,6 +36,8 @@ SIESTA Mapping:
 from __future__ import annotations
 
 import time
+from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -75,6 +77,153 @@ def _stage(timings: dict[str, float] | None, key: str, t_start: float, *results:
     now = time.perf_counter()
     timings[key] = timings.get(key, 0.0) + (now - t_start)
     return now
+
+
+class _StaticByIdentity:
+    """Hashable-by-identity wrapper so an unhashable object (the symmetry engine) can be a static ``jit`` argument."""
+
+    __slots__ = ("obj",)
+
+    def __init__(self, obj: Any) -> None:
+        self.obj = obj
+
+    def __hash__(self) -> int:
+        return id(self.obj)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _StaticByIdentity) and other.obj is self.obj
+
+
+@partial(jax.jit, static_argnames=("mesh_shape", "nspin", "xc_functional", "sym"))
+def _fresh_grid_energies(
+    dm_real: jax.Array,
+    positions: jax.Array,
+    cell: jax.Array,
+    packed: dict[str, jax.Array],
+    na_packed: dict[str, jax.Array],
+    dvol: jax.Array,
+    *,
+    mesh_shape: tuple[int, int, int],
+    nspin: int,
+    xc_functional: str,
+    sym: _StaticByIdentity | None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Fresh grid pass from ``DM_out``: ``(rho_tot, rho_core, sum rho dV, E_H, E_xc, E_V_NA,grid)``."""
+    sym_proj = sym.obj if sym is not None else None
+    xc_eval = LibxcFFIEvaluator(xc_functional)
+    rho = rhoofd_differentiable(dm_real, positions, cell, packed, mesh_shape, nspin)
+    rho_na, v_na, rho_core = neutral_atom_grid_differentiable(positions, cell, na_packed, mesh_shape)
+    tau = tauofd_differentiable(dm_real, positions, cell, packed, mesh_shape, nspin) if xc_eval.is_mgga else None
+    tau_core = tau_core_grid_differentiable(positions, cell, na_packed, mesh_shape) if xc_eval.is_mgga else None
+    if sym_proj is not None:
+        rho = sym_proj.symmetrize_grid(rho)
+        rho_na = sym_proj.symmetrize_grid(rho_na[None, ...])[0]
+        v_na = sym_proj.symmetrize_grid(v_na[None, ...])[0]
+        rho_core = sym_proj.symmetrize_grid(rho_core[None, ...])[0]
+        if tau is not None:
+            tau = sym_proj.symmetrize_grid(tau)
+        if tau_core is not None:
+            tau_core = sym_proj.symmetrize_grid(tau_core[None, ...])[0]
+    rho_tot = rho[0] if nspin == 1 else (rho[0] + rho[1])
+    q_grid = dvol * jnp.sum(rho_tot)
+    _, e_hartree, _ = GridOps().hartree_potential(rho_tot - rho_na, cell)
+    if xc_eval.is_mgga:
+        assert tau is not None
+        e_xc, _, _, _ = xc_eval.evaluate_mgga(
+            rho, tau, cell, nspin, rho_core, tau_core_grid=tau_core, compute_stress=False
+        )
+    else:
+        e_xc, _, _ = xc_eval.evaluate(rho, cell, nspin, rho_core, compute_stress=False)
+    # Atomic part sum_IJ int V_NA,I n_J is exact in two_center.e_na_pair (D-017).
+    e_v_na_grid = dvol * jnp.sum((rho_tot - rho_na) * v_na)
+    return rho_tot, rho_core, q_grid, e_hartree, e_xc, e_v_na_grid
+
+
+def _deformed_grid_terms(
+    disp: jax.Array,
+    eps: jax.Array,
+    dm_real: jax.Array,
+    positions: jax.Array,
+    cell0: jax.Array,
+    packed: dict[str, jax.Array],
+    na_packed: dict[str, jax.Array],
+    mesh_shape: tuple[int, int, int],
+    nspin: int,
+    xc_functional: str,
+    use_rvv10: bool,
+    sym_proj: SymmetryProjector | None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Grid energy terms ``(E_V_NA, E_H, E_xc, E_rVV10)`` at fixed DM, after a displacement and a homogeneous strain.
+
+    Their derivatives at ``disp = 0, eps = 0`` are the grid forces and the grid stress (times the volume).
+    """
+    xc_eval = LibxcFFIEvaluator(xc_functional)
+    xc_id = resolve_xc_id(xc_functional)
+    n1, n2, n3 = mesh_shape
+    def_mat = jnp.eye(3, dtype=jnp.float64) + eps
+    pos = positions @ def_mat.T + disp
+    cell = def_mat @ cell0
+    r_g = rhoofd_differentiable(dm_real, pos, cell, packed, mesh_shape, nspin)
+    rna_g, vna_g, rc_g = neutral_atom_grid_differentiable(pos, cell, na_packed, mesh_shape)
+    t_g = tauofd_differentiable(dm_real, pos, cell, packed, mesh_shape, nspin) if xc_eval.is_mgga else None
+    tc_g = tau_core_grid_differentiable(pos, cell, na_packed, mesh_shape) if xc_eval.is_mgga else None
+    if sym_proj is not None:
+        r_g = sym_proj.symmetrize_grid(r_g)
+        rna_g = sym_proj.symmetrize_grid(rna_g[None, ...])[0]
+        vna_g = sym_proj.symmetrize_grid(vna_g[None, ...])[0]
+        rc_g = sym_proj.symmetrize_grid(rc_g[None, ...])[0]
+        if t_g is not None:
+            t_g = sym_proj.symmetrize_grid(t_g)
+        if tc_g is not None:
+            tc_g = sym_proj.symmetrize_grid(tc_g[None, ...])[0]
+    rtot = r_g[0] if nspin == 1 else (r_g[0] + r_g[1])
+    dv = jnp.abs(jnp.linalg.det(cell)) / float(n1 * n2 * n3)
+    e_vna_l = dv * jnp.sum((rtot - rna_g) * vna_g)
+    _, e_h_l, _ = GridOps().hartree_potential(rtot - rna_g, cell)
+    e_xc_l = xc_energy_from_grid(
+        r_g,
+        cell,
+        nspin,
+        xc_id,
+        rc_g,
+        tau_grid=t_g,
+        tau_core_grid=tc_g,
+        xc_pair=xc_eval.xc_pair if xc_eval.is_mgga else None,
+    )
+    e_rvv_l = RVV10Dispersion().energy_from_density(rtot + rc_g, cell) if use_rvv10 else jnp.zeros(())
+    return e_vna_l, e_h_l, e_xc_l, e_rvv_l
+
+
+@partial(jax.jit, static_argnames=("mesh_shape", "nspin", "xc_functional", "use_rvv10", "sym"))
+def _grid_energy_and_pullback(
+    dm_real: jax.Array,
+    positions: jax.Array,
+    cell: jax.Array,
+    packed: dict[str, jax.Array],
+    na_packed: dict[str, jax.Array],
+    *,
+    mesh_shape: tuple[int, int, int],
+    nspin: int,
+    xc_functional: str,
+    use_rvv10: bool,
+    sym: _StaticByIdentity | None,
+) -> tuple[jax.Array, Any]:
+    """Forward pass of the fixed-DM grid energy and its pullback (a ``jax.tree_util.Partial``) for the backward pass."""
+    sym_proj = sym.obj if sym is not None else None
+
+    def _energy(disp: jax.Array, eps: jax.Array) -> jax.Array:
+        t_vna, t_h, t_xc, t_rvv = _deformed_grid_terms(
+            disp, eps, dm_real, positions, cell, packed, na_packed, mesh_shape, nspin, xc_functional, use_rvv10, sym_proj
+        )
+        return t_vna + t_h + t_xc + t_rvv
+
+    return jax.vjp(_energy, jnp.zeros_like(positions), jnp.zeros((3, 3), dtype=jnp.float64))
+
+
+@jax.jit
+def _apply_pullback(pullback: Any, cotangent: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Backward pass of ``_grid_energy_and_pullback``: gradients with respect to displacement and strain."""
+    return pullback(cotangent)  # type: ignore[no-any-return]
 
 
 def _kb_forces_and_stress(
@@ -333,9 +482,7 @@ class StaticObservableEvaluator:
         dm_real = jnp.real(dm_out) if jnp.iscomplexobj(dm_out) else dm_out
         edm_real = jnp.real(edm_out) if jnp.iscomplexobj(edm_out) else edm_out
 
-        grid_ops = GridOps()
         xc_eval = LibxcFFIEvaluator(config.xc_functional)
-        xc_id = resolve_xc_id(config.xc_functional)
         disp_mode = config.dispersion.upper()
         rvv10 = RVV10Dispersion() if disp_mode == "RVV10" else None
         d3 = DFTD3Dispersion(config.xc_functional) if disp_mode in ("DFT-D3", "DFTD3", "D3") else None
@@ -344,39 +491,23 @@ class StaticObservableEvaluator:
         na_packed = _pack_na_buffers(structure, basis)
 
         # 1. Mandatory fresh non-mixed post-SCF evaluation from DM_out
-        rho = grid_ops.density_on_grid(dm_real, structure, basis, pattern, mesh_shape, config.nspin)
-        rho_na, v_na, rho_core = grid_ops.neutral_atom_grid(structure, basis, mesh_shape)
-        tau = (
-            grid_ops.kinetic_density_on_grid(dm_real, structure, basis, pattern, mesh_shape, config.nspin)
-            if xc_eval.is_mgga
-            else None
+        sym_static = _StaticByIdentity(sym_proj) if sym_proj is not None else None
+        mesh_static = (int(mesh_shape[0]), int(mesh_shape[1]), int(mesh_shape[2]))
+        rho_tot, rho_core, q_grid_arr, e_hartree, e_xc, e_v_na_grid = _fresh_grid_energies(
+            dm_real,
+            structure.positions,
+            structure.cell,
+            packed,
+            na_packed,
+            jnp.asarray(dvol, dtype=jnp.float64),
+            mesh_shape=mesh_static,
+            nspin=config.nspin,
+            xc_functional=config.xc_functional,
+            sym=sym_static,
         )
-        tau_core = grid_ops.tau_core_grid(structure, basis, mesh_shape) if xc_eval.is_mgga else None
-        if sym_proj is not None:
-            rho = sym_proj.symmetrize_grid(rho)
-            rho_na = sym_proj.symmetrize_grid(rho_na[None, ...])[0]
-            v_na = sym_proj.symmetrize_grid(v_na[None, ...])[0]
-            rho_core = sym_proj.symmetrize_grid(rho_core[None, ...])[0]
-            if tau is not None:
-                tau = sym_proj.symmetrize_grid(tau)
-            if tau_core is not None:
-                tau_core = sym_proj.symmetrize_grid(tau_core[None, ...])[0]
-
-        rho_tot = rho[0] if config.nspin == 1 else (rho[0] + rho[1])
-        q_grid = float(dvol * jnp.sum(rho_tot))
+        q_grid = float(q_grid_arr)
         n_electrons = basis.total_valence_electrons - config.net_charge
         charge_residual = jnp.asarray(q_grid - n_electrons, dtype=jnp.float64)
-
-        _, e_hartree, _ = grid_ops.hartree_potential(rho_tot - rho_na, structure.cell)
-        if xc_eval.is_mgga:
-            assert tau is not None
-            e_xc, _, _, _ = xc_eval.evaluate_mgga(
-                rho, tau, structure.cell, config.nspin, rho_core, tau_core_grid=tau_core, compute_stress=False
-            )
-        else:
-            e_xc, _, _ = xc_eval.evaluate(rho, structure.cell, config.nspin, rho_core, compute_stress=False)
-        # Atomic part sum_IJ int V_NA,I n_J is exact in two_center.e_na_pair (D-017).
-        e_v_na_grid = dvol * jnp.sum((rho_tot - rho_na) * v_na)
         t_mark = _stage(timings_out, "fresh_grid", t_mark, e_hartree, e_xc, e_v_na_grid, charge_residual)
 
         dm_tot = dm_real[0] if config.nspin == 1 else (dm_real[0] + dm_real[1])
@@ -412,67 +543,45 @@ class StaticObservableEvaluator:
             else jnp.array(jnp.nan, dtype=jnp.float64)
         )
 
-        # 2. Fixed-(D, E) variational grid forces & stress via jax.grad
-        # Differentiate directly wrt (displacement, homogeneous strain eps) so both
-        # cell deformation and atomic coordinate scaling contribute to stress_grid.
-        def _deformed_grid_terms(disp: jax.Array, eps: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-            def_mat = jnp.eye(3, dtype=jnp.float64) + eps
-            pos = structure.positions @ def_mat.T + disp
-            cell = def_mat @ structure.cell
-            r_g = rhoofd_differentiable(dm_real, pos, cell, packed, mesh_shape, config.nspin)
-            rna_g, vna_g, rc_g = neutral_atom_grid_differentiable(pos, cell, na_packed, mesh_shape)
-            t_g = (
-                tauofd_differentiable(dm_real, pos, cell, packed, mesh_shape, config.nspin)
-                if xc_eval.is_mgga
-                else None
-            )
-            tc_g = (
-                tau_core_grid_differentiable(pos, cell, na_packed, mesh_shape)
-                if xc_eval.is_mgga
-                else None
-            )
-            if sym_proj is not None:
-                r_g = sym_proj.symmetrize_grid(r_g)
-                rna_g = sym_proj.symmetrize_grid(rna_g[None, ...])[0]
-                vna_g = sym_proj.symmetrize_grid(vna_g[None, ...])[0]
-                rc_g = sym_proj.symmetrize_grid(rc_g[None, ...])[0]
-                if t_g is not None:
-                    t_g = sym_proj.symmetrize_grid(t_g)
-                if tc_g is not None:
-                    tc_g = sym_proj.symmetrize_grid(tc_g[None, ...])[0]
-            rtot = r_g[0] if config.nspin == 1 else (r_g[0] + r_g[1])
-            dv = jnp.abs(jnp.linalg.det(cell)) / float(n1 * n2 * n3)
-            e_vna_l = dv * jnp.sum((rtot - rna_g) * vna_g)
-            _, e_h_l, _ = grid_ops.hartree_potential(rtot - rna_g, cell)
-            e_xc_l = xc_energy_from_grid(
-                r_g,
-                cell,
+        # 2. Fixed-(D, E) variational grid forces & stress: derivatives of the grid energy with respect to
+        # (displacement, homogeneous strain eps), so both the cell deformation and the scaled coordinates contribute.
+        def _grid_terms_here(disp: jax.Array, eps: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _deformed_grid_terms(
+                disp,
+                eps,
+                dm_real,
+                structure.positions,
+                structure.cell,
+                packed,
+                na_packed,
+                mesh_static,
                 config.nspin,
-                xc_id,
-                rc_g,
-                tau_grid=t_g,
-                tau_core_grid=tc_g,
-                xc_pair=xc_eval.xc_pair if xc_eval.is_mgga else None,
+                config.xc_functional,
+                rvv10 is not None,
+                sym_proj,
             )
-            e_rvv_l = rvv10.energy_from_density(rtot + rc_g, cell) if rvv10 is not None else jnp.zeros(())
-            return e_vna_l, e_h_l, e_xc_l, e_rvv_l
-
-        def _deformed_grid_energy(disp: jax.Array, eps: jax.Array) -> jax.Array:
-            t_vna, t_h, t_xc, t_rvv = _deformed_grid_terms(disp, eps)
-            return t_vna + t_h + t_xc + t_rvv
 
         oa = np.asarray(basis.orb_atom, dtype=np.int32)
         if not compute_forces_stress:
             forces = jnp.zeros((structure.n_atoms, 3), dtype=jnp.float64)
             stress = jnp.zeros((3, 3), dtype=jnp.float64)
         else:
-            # jax.vjp with a unit cotangent is what jax.grad does; splitting it lets the forward pass and the
-            # backward kernels be timed separately.
-            e_grid, grid_pullback = jax.vjp(
-                _deformed_grid_energy, jnp.zeros_like(structure.positions), jnp.zeros((3, 3), dtype=jnp.float64)
+            # jax.vjp with a unit cotangent is what jax.grad does; the compiled forward pass returns the pullback so
+            # the forward pass and the backward kernels can be timed separately.
+            e_grid, grid_pullback = _grid_energy_and_pullback(
+                dm_real,
+                structure.positions,
+                structure.cell,
+                packed,
+                na_packed,
+                mesh_shape=mesh_static,
+                nspin=config.nspin,
+                xc_functional=config.xc_functional,
+                use_rvv10=rvv10 is not None,
+                sym=sym_static,
             )
             t_mark = _stage(timings_out, "grid_forward", t_mark, e_grid)
-            g_grid_pos, g_grid_eps = grid_pullback(jnp.ones_like(e_grid))
+            g_grid_pos, g_grid_eps = _apply_pullback(grid_pullback, jnp.ones_like(e_grid))
             t_mark = _stage(timings_out, "grid_backward", t_mark, g_grid_pos, g_grid_eps)
             f_grid = -g_grid_pos
             stress_grid = g_grid_eps / vol
@@ -480,7 +589,7 @@ class StaticObservableEvaluator:
             if components_out is not None:
                 zero_d, zero_e = jnp.zeros_like(structure.positions), jnp.zeros((3, 3), dtype=jnp.float64)
                 for idx, name in enumerate(("na_grid", "hartree", "xc", "dispersion")):
-                    g_idx = jax.grad(lambda d, e, i=idx: _deformed_grid_terms(d, e)[i], argnums=1)(zero_d, zero_e)
+                    g_idx = jax.grad(lambda d, e, i=idx: _grid_terms_here(d, e)[i], argnums=1)(zero_d, zero_e)
                     grid_term_stress[name] = np.asarray(g_idx, dtype=np.float64) / vol
                 t_mark = _stage(timings_out, "grid_components", t_mark)
 

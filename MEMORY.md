@@ -4,7 +4,7 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-23
+- **Last updated:** 2026-11-23 (D-046, D-047 on `perf/fixed-costs`)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
@@ -51,14 +51,16 @@
 - SCF iteration 2.4–7.7x faster than SIESTA on 18 ranks and 1.5–3.0x faster than on 192 ranks (8–512 atoms).
 - Forces + stress 0.31–6.5 s (8–512 atoms): faster than SIESTA on 18 ranks from 64 atoms up, 2–4x slower than 192.
 - r2SCAN forces + stress at 512 atoms 14.8 s with the Hessian plan streamed from host memory (D-043, D-044).
-- Set-up and compilation dominate small cells: 7.7 s + 19 s at 64 atoms against 0.5 s for SIESTA's set-up.
+- Set-up and compilation dominate small cells: 7.7 s + 19 s at 64 atoms against 0.5 s for SIESTA's set-up (A100,
+  before D-046/D-047; on the laptop those two cut a 64-atom single point from 84 s to 39 s, A100 numbers pending).
 
 ## Open issues
 
-- **Set-up and compilation cost:** two-centre set-up and the first SCF call (compilation) decide single points and MD
-  steps below about 200 atoms.
+- **Set-up and compilation cost:** reduced by D-046 (no recompilation per geometry, far fewer first-call
+  compilations, opt-in persistent cache) and D-047 (threaded host builds); the A100 effect is not measured yet. The
+  sparse pattern is still NumPy (13 s at 512 atoms on the laptop).
 - **Host-side work left in the forces:** two-centre derivatives (0.32 s at 64 atoms) are now the largest stage.
-- **Meta-GGA XC on the host:** Libxc meta-GGA still runs on the host (half the r2SCAN iteration).
+- **Meta-GGA XC on the host:** Libxc meta-GGA still runs on the host, now threaded (D-047).
 - **Plan limits:** `int32` value offsets cap a grid plan at 2^31 orbital values (about 2800 Si atoms); the host plan
   must fit in host memory.
 - **SIESTA re-measurement:** SIESTA timings come from shared nodes with `DirectPhi .false.`; an exclusive-node run

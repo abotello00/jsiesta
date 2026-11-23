@@ -39,6 +39,9 @@ import numpy as np
 
 from jax_siesta.core.types import KPointMesh, SparsePattern
 
+#: Gather tables of the Bloch assembly, ``(groups, dense)`` (see ``bloch_assembly_plan``).
+AssemblyPlan = tuple[np.ndarray | jax.Array, np.ndarray | jax.Array]
+
 
 def _assembly_plan(src_orb: jax.Array, dst_orb: jax.Array, n_orb: int) -> tuple[np.ndarray, np.ndarray] | None:
     """Host index tables that turn the edge-to-dense scatter-add into two gathers; ``None`` for traced patterns.
@@ -65,6 +68,42 @@ def _assembly_plan(src_orb: jax.Array, dst_orb: jax.Array, n_orb: int) -> tuple[
     return groups, dense
 
 
+def bloch_assembly_plan(
+    pattern: SparsePattern, kmesh: KPointMesh, nspin: int
+) -> tuple[AssemblyPlan | None, bool]:
+    r"""Host-side data the eigensolver derives from a concrete pattern and k-mesh, computed once.
+
+    Theory:
+        The Bloch sums :math:`H_{\mu\nu}(\mathbf{k}) = \sum_{\mathbf{T}} H_{\mu\nu}(\mathbf{T})
+        e^{2\pi i \mathbf{k}\cdot\mathbf{T}}` group the edges of each orbital pair; when every
+        :math:`2\mathbf{k}` is integer and ``nspin`` is 1 or 2 the Bloch matrices are real.
+
+    Algorithm:
+        Builds the gather tables of ``_assembly_plan`` and the real-arithmetic flag from the concrete arrays.
+        Passing them to ``solve``/``overlap_transform`` lets a caller compile those methods with the pattern and
+        k-mesh as traced arguments (one compilation for every geometry with the same shapes) without losing the
+        gather assembly or the real path.
+
+    Parameters:
+        pattern: Concrete ``SparsePattern``.
+        kmesh: Concrete ``KPointMesh``.
+        nspin: Spin mode ``1, 2, 4, 8``.
+
+    Returns:
+        ``(assembly_plan, real_k)``: the ``(groups, dense)`` index tables (``None`` if the pattern is traced) and
+        whether the Bloch problem is real.
+
+    Invariants:
+        Pure function of the pattern indices, the k-points and ``nspin``.
+
+    SIESTA Mapping:
+        The index bookkeeping of ``diagon``/``cdiag`` for the Bloch sums, done once per pattern.
+    """
+    return _assembly_plan(pattern.src_orb, pattern.dst_unit_orb, pattern.n_orb), _real_bloch_problem(
+        kmesh.kpoints_frac, nspin
+    )
+
+
 def _bloch_assemble(
     edge_vals: jax.Array,
     src_orb: jax.Array,
@@ -72,6 +111,7 @@ def _bloch_assemble(
     edge_shifts: jax.Array,
     kpoints_frac: jax.Array,
     n_orb: int,
+    plan: AssemblyPlan | None = None,
 ) -> jax.Array:
     """Assemble ``(n_k, n_orb, n_orb)`` complex matrices from sparse real/complex edges.
 
@@ -81,7 +121,8 @@ def _bloch_assemble(
     phases = jnp.exp(2j * jnp.pi * (kpoints_frac @ edge_shifts.T))  # (n_k, n_edges)
     weighted = phases * edge_vals[None, :]  # (n_k, n_edges)
     n_k = kpoints_frac.shape[0]
-    plan = _assembly_plan(src_orb, dst_orb, n_orb)
+    if plan is None:
+        plan = _assembly_plan(src_orb, dst_orb, n_orb)
     if plan is None:
         mats = jnp.zeros((n_k, n_orb, n_orb), dtype=jnp.complex128)
         return mats.at[:, src_orb, dst_orb].add(weighted)
@@ -165,7 +206,7 @@ def batched_overlap_transform(s_k: jax.Array, k_batch_size: int | None = None) -
     return _map_k(_overlap_transform_single, (s_k,), k_batch_size)
 
 
-def _fermi_dirac(eps: jax.Array, mu: jax.Array, temp_ha: float) -> jax.Array:
+def _fermi_dirac(eps: jax.Array, mu: jax.Array, temp_ha: float | jax.Array) -> jax.Array:
     """Numerically stable Fermi-Dirac occupation in ``[0, 1]``."""
     t_eff = jnp.maximum(temp_ha, 1e-8)
     x = jnp.clip((eps - mu) / t_eff, -60.0, 60.0)
@@ -175,8 +216,8 @@ def _fermi_dirac(eps: jax.Array, mu: jax.Array, temp_ha: float) -> jax.Array:
 def _solve_fermi_level(
     evals: jax.Array,
     weights: jax.Array,
-    n_electrons: float,
-    temp_ha: float,
+    n_electrons: float | jax.Array,
+    temp_ha: float | jax.Array,
     g_spin: float,
 ) -> jax.Array:
     """Determine chemical potential ``mu_F`` via 64-step bisection."""
@@ -196,7 +237,7 @@ def _solve_fermi_level(
     return 0.5 * (lo_f + hi_f)
 
 
-def _entropy_term(occ: jax.Array, weights: jax.Array, temp_ha: float, g_spin: float) -> jax.Array:
+def _entropy_term(occ: jax.Array, weights: jax.Array, temp_ha: float | jax.Array, g_spin: float) -> jax.Array:
     """Compute electronic entropy contribution ``-T * S_el`` (Hartree, negative)."""
     occ_clip = jnp.clip(occ, 1e-15, 1.0 - 1e-15)
     s_per_state = -(occ_clip * jnp.log(occ_clip) + (1.0 - occ_clip) * jnp.log(1.0 - occ_clip))
@@ -281,13 +322,25 @@ class GeneralizedEigenSolver:
         self.k_batch_size = k_batch_size
 
     def _overlap_blocks(
-        self, s_sparse: jax.Array, pattern: SparsePattern, kmesh: KPointMesh, nspin: int, real_k: bool
+        self,
+        s_sparse: jax.Array,
+        pattern: SparsePattern,
+        kmesh: KPointMesh,
+        nspin: int,
+        real_k: bool,
+        assembly_plan: AssemblyPlan | None = None,
     ) -> jax.Array:
         """Bloch overlaps ``S(k)`` (``(n_k, N, N)``), or ``diag(S, S)`` (``(n_k, 2N, 2N)``) for ``nspin = 4, 8``."""
         n_orb = pattern.n_orb
         e_shifts = pattern.cell_shifts[pattern.edge_cell_idx].astype(jnp.float64)
         s_k = _bloch_assemble(
-            s_sparse.astype(jnp.complex128), pattern.src_orb, pattern.dst_unit_orb, e_shifts, kmesh.kpoints_frac, n_orb
+            s_sparse.astype(jnp.complex128),
+            pattern.src_orb,
+            pattern.dst_unit_orb,
+            e_shifts,
+            kmesh.kpoints_frac,
+            n_orb,
+            assembly_plan,
         )
         if nspin in (4, 8):
             z_k = jnp.zeros_like(s_k)
@@ -304,6 +357,8 @@ class GeneralizedEigenSolver:
         kmesh: KPointMesh,
         nspin: int,
         k_batch_size: int | None = None,
+        assembly_plan: AssemblyPlan | None = None,
+        real_k: bool | None = None,
     ) -> jax.Array:
         r"""Orthogonalising transforms of the Bloch overlaps, for reuse across the calls of ``solve``.
 
@@ -321,6 +376,8 @@ class GeneralizedEigenSolver:
             kmesh: ``KPointMesh`` PyTree.
             nspin: Spin mode ``1, 2, 4, 8``.
             k_batch_size: Optional maximum k-points per vectorized batch.
+            assembly_plan: Optional gather tables from ``bloch_assembly_plan`` (needed for a traced pattern).
+            real_k: Optional real-arithmetic flag from ``bloch_assembly_plan`` (needed for traced k-points).
 
         Returns:
             ``(n_k, M, M)`` transforms, ``M = N`` or ``2N``.
@@ -331,9 +388,12 @@ class GeneralizedEigenSolver:
         SIESTA Mapping:
             The overlap factorisation of ``rdiag``/``cdiag``, hoisted out of the SCF loop.
         """
-        real_k = _real_bloch_problem(kmesh.kpoints_frac, nspin)
+        if real_k is None:
+            real_k = _real_bloch_problem(kmesh.kpoints_frac, nspin)
         eff_batch = self.k_batch_size if k_batch_size is None else k_batch_size
-        return batched_overlap_transform(self._overlap_blocks(s_sparse, pattern, kmesh, nspin, real_k), eff_batch)
+        return batched_overlap_transform(
+            self._overlap_blocks(s_sparse, pattern, kmesh, nspin, real_k, assembly_plan), eff_batch
+        )
 
     def solve(
         self,
@@ -341,11 +401,13 @@ class GeneralizedEigenSolver:
         s_sparse: jax.Array,
         pattern: SparsePattern,
         kmesh: KPointMesh,
-        n_electrons: float,
-        electronic_temp_ha: float,
+        n_electrons: float | jax.Array,
+        electronic_temp_ha: float | jax.Array,
         nspin: int,
         k_batch_size: int | None = None,
         s_transform: jax.Array | None = None,
+        assembly_plan: AssemblyPlan | None = None,
+        real_k: bool | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
         r"""Solve generalized KS equations and return ``(dm_out, edm_out, fermi_ha, e_band_ha, entropy_ha)``.
 
@@ -373,6 +435,8 @@ class GeneralizedEigenSolver:
             nspin: Spin mode ``1, 2, 4, 8``.
             k_batch_size: Optional maximum k-points per vectorized batch.
             s_transform: Optional ``overlap_transform(s_sparse, pattern, kmesh, nspin)``.
+            assembly_plan: Optional gather tables from ``bloch_assembly_plan`` (needed for a traced pattern).
+            real_k: Optional real-arithmetic flag from ``bloch_assembly_plan`` (needed for traced k-points).
 
         Returns:
             Tuple ``(dm_out, edm_out, fermi_level_ha, e_band_ha, entropy_ha)``.
@@ -394,13 +458,18 @@ class GeneralizedEigenSolver:
         phases_conj = jnp.exp(-2j * jnp.pi * (kpts @ e_shifts.T))  # (n_k, n_edges)
 
         eff_batch = self.k_batch_size if k_batch_size is None else k_batch_size
-        real_k = _real_bloch_problem(kpts, nspin)
+        if real_k is None:
+            real_k = _real_bloch_problem(kpts, nspin)
+        if assembly_plan is None:
+            assembly_plan = _assembly_plan(src, dst, n_orb)
         x_k = s_transform
         if x_k is None:
-            x_k = batched_overlap_transform(self._overlap_blocks(s_sparse, pattern, kmesh, nspin, real_k), eff_batch)
+            x_k = batched_overlap_transform(
+                self._overlap_blocks(s_sparse, pattern, kmesh, nspin, real_k, assembly_plan), eff_batch
+            )
 
         def _h(edges: jax.Array) -> jax.Array:
-            h_mat = _bloch_assemble(edges.astype(jnp.complex128), src, dst, e_shifts, kpts, n_orb)
+            h_mat = _bloch_assemble(edges.astype(jnp.complex128), src, dst, e_shifts, kpts, n_orb, assembly_plan)
             return jnp.real(h_mat) if real_k else h_mat
 
         if nspin == 1:
@@ -449,10 +518,10 @@ class GeneralizedEigenSolver:
 
         # nspin == 4 (NC) or nspin == 8 (SOC): 2N x 2N complex 2-spinor Hamiltonian
         # h_sparse may be float64 (4, n_edges) or complex128 (4, n_edges) [H_uu, H_dd, H_ud_re, H_ud_im]
-        h_uu = _bloch_assemble(h_sparse[0].astype(jnp.complex128), src, dst, e_shifts, kpts, n_orb)
-        h_dd = _bloch_assemble(h_sparse[1].astype(jnp.complex128), src, dst, e_shifts, kpts, n_orb)
+        h_uu = _bloch_assemble(h_sparse[0].astype(jnp.complex128), src, dst, e_shifts, kpts, n_orb, assembly_plan)
+        h_dd = _bloch_assemble(h_sparse[1].astype(jnp.complex128), src, dst, e_shifts, kpts, n_orb, assembly_plan)
         h_ud_edges = (h_sparse[2] + 1j * h_sparse[3]).astype(jnp.complex128)
-        h_ud = _bloch_assemble(h_ud_edges, src, dst, e_shifts, kpts, n_orb)
+        h_ud = _bloch_assemble(h_ud_edges, src, dst, e_shifts, kpts, n_orb, assembly_plan)
         h_du = jnp.swapaxes(jnp.conj(h_ud), -1, -2)
 
         top = jnp.concatenate([h_uu, h_ud], axis=2)

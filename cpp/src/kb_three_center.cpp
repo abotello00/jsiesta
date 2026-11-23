@@ -30,6 +30,8 @@
  * \c final_H_f_stress.
  */
 
+#include "jsiesta/threading.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -46,31 +48,9 @@ inline int64_t pack_key(int64_t nu, int64_t t0, int64_t t1, int64_t t2) {
            (t2 + kShiftHalf);
 }
 
-int resolve_threads(int64_t work) {
-    if (work < 2048) return 1;
-    const unsigned hc = std::thread::hardware_concurrency();
-    const char* env = std::getenv("OMP_NUM_THREADS");
-    if (env != nullptr && env[0] != '\0') {
-        const int n = std::atoi(env);
-        if (n >= 1) return hc == 0 ? n : std::min(n, static_cast<int>(hc));
-    }
-    return hc == 0 ? 1 : static_cast<int>(std::min<unsigned>(hc, 8U));
-}
+int resolve_threads(int64_t work) { return jsiesta::threading::thread_count(work, 2048); }
 
-template <typename F>
-void parallel_ranges(int64_t n, int n_threads, F&& body) {
-    if (n_threads <= 1) {
-        body(0, int64_t{0}, n);
-        return;
-    }
-    std::vector<std::thread> pool;
-    pool.reserve(static_cast<size_t>(n_threads));
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t lo = n * t / n_threads, hi = n * (t + 1) / n_threads;
-        pool.emplace_back([&body, t, lo, hi]() { body(t, lo, hi); });
-    }
-    for (auto& th : pool) th.join();
-}
+using jsiesta::threading::parallel_ranges;
 
 }  // namespace
 

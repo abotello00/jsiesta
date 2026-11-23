@@ -1,5 +1,7 @@
 flowchart LR
     core["jax_siesta.core"]
+    core.compilation["jax_siesta.core.compilation"]
+    core --> core.compilation
     core.ffi["jax_siesta.core.ffi"]
     core --> core.ffi
     core.protocols["jax_siesta.core.protocols"]

@@ -20,6 +20,7 @@
 
 #include "jsiesta/two_center.hpp"
 #include "jsiesta/math_utils.hpp"
+#include "jsiesta/threading.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -323,32 +324,55 @@ int32_t jsiesta_eval_two_center_st(
     for (int e = 0; e < n_edges; ++e) {
         used_pairs[edge_shell1[e] * n_shells + edge_shell2[e]] = true;
     }
-    for (int s1 = 0; s1 < n_shells; ++s1) {
-        for (int s2 = 0; s2 < n_shells; ++s2) {
-            const int pid = s1 * n_shells + s2;
-            if (!used_pairs[pid]) continue;
-            s_splines[pid] = build_pair_splines(rts[s1], rts[s2], k_pts, k_wts, false);
-            t_splines[pid] = build_pair_splines(rts[s1], rts[s2], k_pts, k_wts, true);
-        }
+    std::vector<int> used;
+    for (int pid = 0; pid < n_pairs; ++pid) {
+        if (used_pairs[pid]) used.push_back(pid);
     }
+    // The radial tables of the shell pairs are independent: one range of pairs per thread.
+    const int n_tab = 2 * static_cast<int>(used.size());
+    jsiesta::threading::parallel_ranges(
+        n_tab, jsiesta::threading::thread_count(n_tab, 2), [&](int, int64_t lo, int64_t hi) {
+            for (int64_t i = lo; i < hi; ++i) {
+                const int pid = used[static_cast<size_t>(i / 2)];
+                const int s1 = pid / n_shells, s2 = pid % n_shells;
+                if (i % 2 == 0) {
+                    s_splines[pid] = build_pair_splines(rts[s1], rts[s2], k_pts, k_wts, false);
+                } else {
+                    t_splines[pid] = build_pair_splines(rts[s1], rts[s2], k_pts, k_wts, true);
+                }
+            }
+        });
 
+    // Orbital pairs in ranges, one per thread. Consecutive pairs of a pattern row usually share the atom-pair vector,
+    // so the solid harmonics are recomputed only when the vector changes (same values either way).
     const int n_big = (kMaxBigL + 1) * (kMaxBigL + 1);
-    std::vector<double> c_lm(n_big), dc_lm(3 * n_big);
-    for (int e = 0; e < n_edges; ++e) {
-        const int s1 = edge_shell1[e];
-        const int s2 = edge_shell2[e];
-        const int pid = s1 * n_shells + s2;
-        const double rx = edge_vectors[3 * e + 0];
-        const double ry = edge_vectors[3 * e + 1];
-        const double rz = edge_vectors[3 * e + 2];
-        jsiesta::math::real_solid_harmonics_and_grad(rx, ry, rz, kMaxBigL, c_lm.data(), dc_lm.data());
-        eval_pair_element(
-            s_splines[pid], edge_m1[e], edge_m2[e], rx, ry, rz,
-            c_lm.data(), dc_lm.data(), out_s[e], out_ds + 3 * e);
-        eval_pair_element(
-            t_splines[pid], edge_m1[e], edge_m2[e], rx, ry, rz,
-            c_lm.data(), dc_lm.data(), out_t[e], out_dt + 3 * e);
-    }
+    jsiesta::threading::parallel_ranges(
+        n_edges, jsiesta::threading::thread_count(n_edges, 4096), [&](int, int64_t lo, int64_t hi) {
+            std::vector<double> c_lm(n_big), dc_lm(3 * n_big);
+            double last[3] = {0.0, 0.0, 0.0};
+            bool have_last = false;
+            for (int64_t e = lo; e < hi; ++e) {
+                const int s1 = edge_shell1[e];
+                const int s2 = edge_shell2[e];
+                const int pid = s1 * n_shells + s2;
+                const double rx = edge_vectors[3 * e + 0];
+                const double ry = edge_vectors[3 * e + 1];
+                const double rz = edge_vectors[3 * e + 2];
+                if (!have_last || rx != last[0] || ry != last[1] || rz != last[2]) {
+                    jsiesta::math::real_solid_harmonics_and_grad(rx, ry, rz, kMaxBigL, c_lm.data(), dc_lm.data());
+                    last[0] = rx;
+                    last[1] = ry;
+                    last[2] = rz;
+                    have_last = true;
+                }
+                eval_pair_element(
+                    s_splines[pid], edge_m1[e], edge_m2[e], rx, ry, rz,
+                    c_lm.data(), dc_lm.data(), out_s[e], out_ds + 3 * e);
+                eval_pair_element(
+                    t_splines[pid], edge_m1[e], edge_m2[e], rx, ry, rz,
+                    c_lm.data(), dc_lm.data(), out_t[e], out_dt + 3 * e);
+            }
+        });
     return 0;
 }
 
@@ -397,28 +421,45 @@ int32_t jsiesta_eval_kb_overlaps(
     for (int i = 0; i < n_links; ++i) {
         used_links[link_pao_shell[i] * n_kb_shells + link_kb_shell[i]] = true;
     }
-    for (int s = 0; s < n_pao_shells; ++s) {
-        for (int k = 0; k < n_kb_shells; ++k) {
-            const int pid = s * n_kb_shells + k;
-            if (!used_links[pid]) continue;
-            p_splines[pid] = build_pair_splines(rts_pao[s], rts_kb[k], k_pts, k_wts, false);
-        }
+    std::vector<int> used;
+    for (int pid = 0; pid < n_pao_shells * n_kb_shells; ++pid) {
+        if (used_links[pid]) used.push_back(pid);
     }
+    const int n_used = static_cast<int>(used.size());
+    jsiesta::threading::parallel_ranges(
+        n_used, jsiesta::threading::thread_count(n_used, 2), [&](int, int64_t lo, int64_t hi) {
+            for (int64_t i = lo; i < hi; ++i) {
+                const int pid = used[static_cast<size_t>(i)];
+                p_splines[pid] = build_pair_splines(rts_pao[pid / n_kb_shells], rts_kb[pid % n_kb_shells], k_pts, k_wts, false);
+            }
+        });
 
+    // Links in ranges, one per thread; the solid harmonics are recomputed only when the link vector changes.
     const int n_big = (kMaxBigL + 1) * (kMaxBigL + 1);
-    std::vector<double> c_lm(n_big), dc_lm(3 * n_big);
-    for (int i = 0; i < n_links; ++i) {
-        const int s = link_pao_shell[i];
-        const int k = link_kb_shell[i];
-        const double rx = link_vectors[3 * i + 0];
-        const double ry = link_vectors[3 * i + 1];
-        const double rz = link_vectors[3 * i + 2];
-        jsiesta::math::real_solid_harmonics_and_grad(rx, ry, rz, kMaxBigL, c_lm.data(), dc_lm.data());
-        eval_pair_element(
-            p_splines[s * n_kb_shells + k],
-            link_m1[i], link_m2[i], rx, ry, rz,
-            c_lm.data(), dc_lm.data(), out_p[i], out_dp + 3 * i);
-    }
+    jsiesta::threading::parallel_ranges(
+        n_links, jsiesta::threading::thread_count(n_links, 4096), [&](int, int64_t lo, int64_t hi) {
+            std::vector<double> c_lm(n_big), dc_lm(3 * n_big);
+            double last[3] = {0.0, 0.0, 0.0};
+            bool have_last = false;
+            for (int64_t i = lo; i < hi; ++i) {
+                const int s = link_pao_shell[i];
+                const int k = link_kb_shell[i];
+                const double rx = link_vectors[3 * i + 0];
+                const double ry = link_vectors[3 * i + 1];
+                const double rz = link_vectors[3 * i + 2];
+                if (!have_last || rx != last[0] || ry != last[1] || rz != last[2]) {
+                    jsiesta::math::real_solid_harmonics_and_grad(rx, ry, rz, kMaxBigL, c_lm.data(), dc_lm.data());
+                    last[0] = rx;
+                    last[1] = ry;
+                    last[2] = rz;
+                    have_last = true;
+                }
+                eval_pair_element(
+                    p_splines[s * n_kb_shells + k],
+                    link_m1[i], link_m2[i], rx, ry, rz,
+                    c_lm.data(), dc_lm.data(), out_p[i], out_dp + 3 * i);
+            }
+        });
     return 0;
 }
 

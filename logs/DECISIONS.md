@@ -870,3 +870,57 @@
 - **Physics:** none; the engine and kernels are byte-identical to `ea4b882` except for docstring paths to the moved
   design documents.
 
+## D-046: Compile once per array shape, not once per geometry (2026-11-23)
+- **Status:** accepted on the CPU (branch `perf/fixed-costs`); A100 measurement pending.
+- **Why:** `run_scf` built its compiled functions as closures over the geometry (positions, neutral-atom density,
+  packed basis, overlap), so every new geometry re-traced and recompiled them even with unchanged shapes: 2.2-2.6 s
+  for a 2-atom cell on the laptop, about 2 s at 64 atoms and 9 s at 512 on the A100 (from the scaling jobs). A
+  persistent cache could not hit either. The first call of a process also made about 400 small compilations of
+  one-off array operations run outside any compiled function (initial density matrix, seed potential, the whole force
+  evaluation): 13 of the 16 s of compilation for that cell. (The geometry-step rows of the decks assumed the
+  compilation was paid once; it was not.)
+- **Change:** the SCF's compiled functions (overlap transform, solve, grid Hamiltonian and energies, the seed
+  Hamiltonian, the per-iteration bookkeeping) and the force evaluation's grid stages (fresh grid pass, grid-energy
+  forward pass with its pullback, backward pass) are module-level `jax.jit` functions that take every geometry-dependent
+  array as an argument; only shapes, spin mode, functional, dispersion choice and the symmetry engine (static by
+  identity) are static. The eigensolver accepts the Bloch gather tables and the real-arithmetic flag precomputed once
+  from the concrete pattern (`bloch_assembly_plan`), so the pattern can be a traced argument without losing the gather
+  assembly or the real path. The custom derivatives of the grid kernels carry their packed buffers as residuals instead
+  of closures, so the compiled forward pass can return its pullback. The initial density matrix goes through the
+  compiled solve; the on-site Zeeman seed is vectorised NumPy. `jax_siesta.core.compilation.enable_compilation_cache`
+  (opt-in, `JSIESTA_COMPILATION_CACHE`) points JAX's persistent cache at a directory with zero thresholds, so the many
+  short compilations are cached too.
+- **Effect (laptop, Si 2 atoms, SCF + forces):** first call 397 compilations, 16.6 s of compile time -> 43, 3.6 s;
+  with a warm persistent cache 0.5 s. A new geometry with the same shapes: 4 compilations and 3.7 s -> none and 0.9 s.
+  64 atoms (6 SCF iterations + forces, together with D-047): 84.3 s -> 38.9 s for the first geometry, 65.9 s -> 37.8 s
+  for the second.
+- **Physics:** none. Energies equal to 6e-14 eV (the initial solve is now compiled instead of eager), forces to 1e-17
+  Ha/Bohr; SCF, forces, symmetry, mixer, Harris, meta-GGA/SOC and stress-component tests unchanged (57 passed).
+  New `tests/test_compilation.py`: a second geometry with the same shapes compiles nothing; the cache is opt-in.
+
+## D-047: Threaded host set-up and threaded host Libxc (2026-11-23)
+- **Status:** accepted on the CPU (branch `perf/fixed-costs`); the CUDA + Libxc build compiles on Snellius; A100
+  measurement pending.
+- **Why:** after D-046 the fixed cost of a geometry is host work, all single-threaded: the grid plan build, the
+  overlap/kinetic and KB-overlap integrals (one loop over orbital pairs that recomputed the solid harmonics of the same
+  atom-pair vector for every orbital pair, and spline tables built one shell pair at a time), the sparse pattern
+  (NumPy sorts over all edges and their transposes), and for meta-GGA the host Libxc call (one thread over all grid
+  points).
+- **Change:** `cpp/include/jsiesta/threading.hpp` (thread count from `OMP_NUM_THREADS`, `parallel_ranges`,
+  `run_threads`) replaces the private helpers of the grid and KB kernels. Grid plan: the per-entry sweep runs on atom
+  ranges with per-thread counters whose prefix sums keep the serial order; image grouping runs on point ranges with
+  exact per-point offsets; a plan beyond the `int32` offsets keeps the generic representation instead of overflowing.
+  Two-centre S/T and KB overlaps: spline tables built in parallel over shell pairs, orbital pairs (links) in parallel
+  ranges, solid harmonics recomputed only when the vector changes. Pattern: shift indices by a lookup table instead of
+  `searchsorted`, transposed shift codes by arithmetic, used shifts by `bincount` (no copy of all transposed shifts).
+  Libxc (LDA/GGA and meta-GGA host paths, used by the CPU build and by the GPU's meta-GGA route): grid-point ranges per
+  thread, each with its own Libxc handles.
+- **Effect (laptop, 8 threads, 64 Si atoms):** two-centre 6.35 s -> 2.52 s; first value-plan build and `rhoofd`
+  5.60 s -> 3.82 s; pattern 1.89 s -> 1.30 s (512 atoms: 17.9 s -> 13.3 s); r2SCAN Libxc evaluation on 72^3 points
+  0.197 s -> 0.076 s (spin-unpolarised), 0.366 s -> 0.147 s (polarised).
+- **Physics:** none. Overlap, kinetic and their derivatives, V_KB, the neutral-atom pair energy, the grid density and
+  the plan gradients are bitwise identical to the previous build at 64 atoms; the sparse patterns are identical at 8, 64
+  and 512 atoms; the r2SCAN energy density and potentials are bitwise identical.
+- **Known limits:** the pattern builder is still NumPy (13 s at 512 atoms on the laptop: sorting and the transpose
+  search over 12.7 M edges); a C++ builder would remove most of it.
+

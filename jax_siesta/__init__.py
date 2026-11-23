@@ -27,6 +27,7 @@ import jax as _jax
 if hasattr(_jax, "config"):
     _jax.config.update("jax_enable_x64", True)
 
+from jax_siesta.core.compilation import enable_compilation_cache
 from jax_siesta.core.protocols import (
     BasisAndPseudos,
     DispersionModel,
@@ -51,6 +52,8 @@ from jax_siesta.core.types import (
     SpeciesData,
     Structure,
 )
+
+enable_compilation_cache()  # no-op unless JSIESTA_COMPILATION_CACHE names a directory
 
 __all__ = [
     "BOHR_TO_ANGSTROM",
