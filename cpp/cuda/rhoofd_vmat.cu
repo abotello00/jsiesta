@@ -29,6 +29,7 @@
 #include "jsiesta/xc_semilocal.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1492,6 +1493,7 @@ std::shared_ptr<const DeviceGridPlan> get_device_grid_plan(
         }
         return dp;
     };
+    const auto t_upload = std::chrono::steady_clock::now();
     std::shared_ptr<DeviceGridPlan> dp;
     if (stream_mode != 1) {
         dp = upload_plan(true);
@@ -1539,7 +1541,8 @@ std::shared_ptr<const DeviceGridPlan> get_device_grid_plan(
         return nullptr;
     }
     if (!dp->streamed && std::getenv("JSIESTA_CUDA_PLAN_VERBOSE") != nullptr) {
-        std::fprintf(stderr, "jsiesta: grid plan uploaded: %.2f GB, %zu orbital values, grad=%d hess=%d\n",
+        std::fprintf(stderr, "jsiesta: grid plan uploaded in %.2f s: %.2f GB, %zu orbital values, grad=%d hess=%d\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_upload).count(),
                      plan_bytes / 1e9, flat.n_vals, need_grad ? 1 : 0, need_hess ? 1 : 0);
     }
     lru.insert(lru.begin(), dp);

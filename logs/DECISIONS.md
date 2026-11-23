@@ -932,3 +932,30 @@
 - **Known limits:** the pattern builder is still NumPy (13 s at 512 atoms on the laptop, 16 s on the A100 node: sorting and the transpose
   search over 12.7 M edges); a C++ builder would remove most of it.
 
+
+## D-048: One host grid plan per geometry, built without a serial zero fill (2026-11-23)
+- **Status:** accepted (branch `perf/fixed-costs`); measured on the A100 (jobs 29634256, 29635520, 29635599).
+- **Why:** a stage breakdown of a second Si 512 geometry (job 29634256, 64.8 s for pattern, two-centre, 6 SCF
+  iterations and forces) found 21.3 s in the host grid plans: the SCF built the plan of orbital values (7.9 s), the
+  forces then built the plan with gradients of the same geometry (10.0 s), plus 3.4 s of uploads. Timing the phases of
+  a build (job 29635520) put 4.8 s of either build in one step: `std::vector::resize` zero-filling the per-entry array
+  (27.9 GB at 512 atoms) on one thread, just before the threaded fill sweep overwrites every element. The image arrays
+  were zero-filled serially in the same way.
+- **Change:** the per-entry array and the image arrays use an allocator that leaves trivially constructible elements
+  uninitialised (`PlanVec` in `cpp/src/grid_ffi.cpp`); each thread of the image fill zeroes its own value range before
+  writing it. The host plan cache records the richest variant (gradients, Hessians) requested per system and grid (atom,
+  orbital, shell and radial-point counts, mesh shape); a plainer request for a geometry not yet cached builds that
+  variant, so in a loop over geometries the SCF builds the plan the forces will need and the forces find it in the
+  cache (a cached plan that stores more arrays already matched a plainer request). The first geometry of a process
+  still builds both. The verbose plan logs (`JSIESTA_GRID_PLAN_VERBOSE`, `JSIESTA_CUDA_PLAN_VERBOSE`) report build and
+  upload times.
+- **Effect (A100 node, 18 threads):** value-plan build at 512 atoms 8.29 s -> 3.29 s, gradient plan 10.31 s -> 3.89 s;
+  at 64 atoms 1.00 s -> 0.39 s and 1.26 s -> 0.48 s. Second geometry (6 SCF iterations + forces): Si 512 PBE 64.8 s ->
+  52.6 s (SCF 23.0 s -> 19.1 s, forces 19.1 s -> 9.2 s); Si 64 PBE 6.7 s -> 5.1 s; Si 64 r2SCAN builds one plan with
+  Hessians instead of two plans (7.1 s).
+- **Physics:** none. Densities and plan gradients are bitwise identical to the previous build; energies identical to
+  1e-12 Ha; 26 CUDA and compilation tests (A100) and 55 grid, SCF, force, stress and meta-GGA tests pass.
+- **Known limits:** in a process that alternates systems of the same shapes with and without forces, the plainer runs
+  build the richer plan (more host memory, about 20 % more build time). At 512 atoms the sparse pattern (17 s) is now
+  the largest per-geometry item, then the host two-centre set-up and force terms (11 s) and the 13 GB gradient-plan
+  upload (2.7 s).

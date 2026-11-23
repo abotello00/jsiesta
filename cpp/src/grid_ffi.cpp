@@ -33,6 +33,7 @@
 #include "xla/ffi/api/ffi.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +42,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace ffi = xla::ffi;
@@ -85,6 +87,30 @@ inline int floor_div(int i, int n) {
     return q;
 }
 
+// Allocator that leaves trivially constructible elements uninitialised on resize(n). The plan arrays below are written
+// in full by threaded passes right after they are allocated, so the zero fill of a plain std::vector would only add a
+// serial pass over several GB (and take the page faults on one thread).
+template <typename T>
+struct UninitAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+        using other = UninitAllocator<U>;
+    };
+    UninitAllocator() = default;
+    template <typename U>
+    UninitAllocator(const UninitAllocator<U>&) noexcept {}
+    template <typename U>
+    void construct(U* p) noexcept {
+        ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+template <typename T>
+using PlanVec = std::vector<T, UninitAllocator<T>>;
+
 struct ActiveOrbEntry {
     int32_t orb;
     int32_t s0;
@@ -104,7 +130,7 @@ struct ActiveOrbEntry {
 
 struct ActiveGridCache {
     std::vector<int32_t> grid_offsets;
-    std::vector<ActiveOrbEntry> entries;
+    PlanVec<ActiveOrbEntry> entries;  // every slot is written by the fill sweep
     double dvol = 0.0;
     int64_t n_grid = 0;
 };
@@ -433,12 +459,12 @@ struct GridKernelPlan {
     size_t total_blk_scalars = 0;
 
     std::vector<int32_t> grid_img_offsets;
-    std::vector<GridAtomImage> img_groups;
-    std::vector<double> img_vals;
-    std::vector<double> img_gx;
-    std::vector<double> img_gy;
-    std::vector<double> img_gz;
-    std::vector<double> img_hxx, img_hxy, img_hxz, img_hyy, img_hyz, img_hzz;  // need_hess only
+    PlanVec<GridAtomImage> img_groups;
+    PlanVec<double> img_vals;
+    PlanVec<double> img_gx;
+    PlanVec<double> img_gy;
+    PlanVec<double> img_gz;
+    PlanVec<double> img_hxx, img_hxy, img_hxz, img_hyy, img_hyz, img_hzz;  // need_hess only
 
     inline int32_t lookup_shift(int32_t ds0, int32_t ds1, int32_t ds2) const {
         const int32_t i0 = ds0 - s_min[0];
@@ -561,14 +587,23 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
     if (need_hess) need_grad = true;
     static std::mutex cache_mu;
     static std::vector<std::shared_ptr<const GridKernelPlan>> lru;
+    // richest variant requested so far per system and grid (any geometry)
+    struct RequestedVariant {
+        int32_t n_atoms, n_orb, n_shells, n_pao_pts;
+        int64_t n1, n2, n3;
+        bool grad, hess;
+        bool same_system(int32_t na, int32_t no, int32_t ns, int32_t npts, int64_t g1, int64_t g2, int64_t g3) const {
+            return n_atoms == na && n_orb == no && n_shells == ns && n_pao_pts == npts && n1 == g1 && n2 == g2 &&
+                   n3 == g3;
+        }
+    };
+    static std::vector<RequestedVariant> richest_requested;
 
     const uint64_t bh = GridKernelPlan::compute_base_hash(
         positions, cell, pao_r_max, pao_rcut, pao_l, pao_values,
         orb_atom, orb_g_shell, orb_m, orb_rcut,
         row_ptr, dst_unit_orb, edge_cell_idx, cell_shifts,
         n_atoms, n_orb, n_shells, n_pao_pts, n_edges, n_shifts, n1, n2, n3);
-    const uint64_t h = GridKernelPlan::with_flags(bh, need_grad, need_hess);
-
     {
         std::lock_guard<std::mutex> lock(cache_mu);
         for (size_t idx = 0; idx < lru.size(); ++idx) {
@@ -585,6 +620,24 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
                 return found;
             }
         }
+        // In a loop over geometries of one system (relaxation, MD, finite differences) the SCF builds the value plan
+        // of a geometry and its forces then build the gradient plan of the same geometry: two sweeps over the same
+        // points. Once a richer variant has been requested for this system and grid, a plainer request builds that
+        // variant instead, and the later calls of the geometry find it in the cache (match accepts a richer plan).
+        bool known_system = false;
+        for (auto& k : richest_requested) {
+            if (k.same_system(n_atoms, n_orb, n_shells, n_pao_pts, n1, n2, n3)) {
+                known_system = true;
+                k.grad = k.grad || need_grad;
+                k.hess = k.hess || need_hess;
+                need_grad = k.grad;
+                need_hess = k.hess;
+            }
+        }
+        if (!known_system) {
+            richest_requested.push_back({n_atoms, n_orb, n_shells, n_pao_pts, n1, n2, n3, need_grad, need_hess});
+            if (richest_requested.size() > 8) richest_requested.erase(richest_requested.begin());
+        }
         // cached plans of the same inputs that store fewer arrays are superseded by the one built below; drop them
         // first, so they do not add to the peak memory of the build
         lru.erase(std::remove_if(lru.begin(), lru.end(),
@@ -594,7 +647,9 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
                                  }),
                   lru.end());
     }
+    const uint64_t h = GridKernelPlan::with_flags(bh, need_grad, need_hess);  // key of the variant built below
 
+    const auto t_build = std::chrono::steady_clock::now();
     auto plan = std::make_shared<GridKernelPlan>();
     plan->n1 = n1; plan->n2 = n2; plan->n3 = n3;
     plan->n_atoms = n_atoms; plan->n_orb = n_orb; plan->n_shells = n_shells;
@@ -769,22 +824,22 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
                 }
                 const size_t nv = static_cast<size_t>(n_vals_tot);
                 plan->img_groups.resize(static_cast<size_t>(n_groups));
-                plan->img_vals.assign(nv, 0.0);
-                if (need_grad) {
-                    plan->img_gx.assign(nv, 0.0);
-                    plan->img_gy.assign(nv, 0.0);
-                    plan->img_gz.assign(nv, 0.0);
-                }
+                // allocated uninitialised; each thread zeroes its own value range below (orbitals of an image that do
+                // not reach the point keep a zero)
+                std::vector<PlanVec<double>*> val_arrays{&plan->img_vals};
+                if (need_grad) val_arrays.insert(val_arrays.end(), {&plan->img_gx, &plan->img_gy, &plan->img_gz});
                 if (need_hess) {
-                    for (auto* hv : {&plan->img_hxx, &plan->img_hxy, &plan->img_hxz,
-                                     &plan->img_hyy, &plan->img_hyz, &plan->img_hzz}) {
-                        hv->assign(nv, 0.0);
-                    }
+                    val_arrays.insert(val_arrays.end(), {&plan->img_hxx, &plan->img_hxy, &plan->img_hxz,
+                                                         &plan->img_hyy, &plan->img_hyz, &plan->img_hzz});
                 }
+                for (auto* arr : val_arrays) arr->resize(nv);
                 run_threads(n_thr_pts, [&](int t) {
                     std::vector<TempRef> refs;
                     int64_t p0 = 0, p1 = 0;
                     point_range(t, p0, p1);
+                    const size_t v_lo = static_cast<size_t>(val_off[static_cast<size_t>(p0)]);
+                    const size_t v_hi = static_cast<size_t>(val_off[static_cast<size_t>(p1)]);
+                    for (auto* arr : val_arrays) std::fill(arr->begin() + v_lo, arr->begin() + v_hi, 0.0);
                     for (int64_t p = p0; p < p1; ++p) {
                         sorted_refs(p, refs);
                         int64_t g = grp_off[static_cast<size_t>(p)];
@@ -820,7 +875,7 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
                 });
             }
             // The per-entry arrays are only read by the generic path (no atom blocks); free them.
-            if (plan->use_atom_blocks) std::vector<ActiveOrbEntry>().swap(plan->active.entries);
+            if (plan->use_atom_blocks) PlanVec<ActiveOrbEntry>().swap(plan->active.entries);
         }
     }
 
@@ -841,8 +896,9 @@ std::shared_ptr<const GridKernelPlan> get_or_build_grid_plan(
             const std::size_t n_entries =
                 plan->active.grid_offsets.empty() ? 0 : static_cast<std::size_t>(plan->active.grid_offsets.back());
             std::fprintf(stderr,
-                         "jsiesta: host grid plan built: %.2f GB kept, %.2f GB of per-entry arrays during the build "
-                         "(grad=%d hess=%d); cache %.2f GB in %zu plans\n",
+                         "jsiesta: host grid plan built in %.2f s: %.2f GB kept, %.2f GB of per-entry arrays during "
+                         "the build (grad=%d hess=%d); cache %.2f GB in %zu plans\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_build).count(),
                          bytes(*plan) / 1e9, n_entries * sizeof(ActiveOrbEntry) / 1e9, need_grad ? 1 : 0,
                          need_hess ? 1 : 0, total / 1e9, lru.size());
         }

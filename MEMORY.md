@@ -4,7 +4,7 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-23 (D-046, D-047 on `perf/fixed-costs`)
+- **Last updated:** 2026-11-23 (D-046 to D-048 on `perf/fixed-costs`)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
@@ -58,9 +58,10 @@
 ## Open issues
 
 - **Set-up and compilation cost:** reduced by D-046 (no recompilation per geometry, far fewer first-call
-  compilations, opt-in persistent cache) and D-047 (threaded host builds), measured on the A100. The sparse pattern is
-  still NumPy and now the largest set-up item at 512 atoms (16 s on the A100 node); the rest of the 512-atom
-  per-geometry cost (SCF 23 s, forces 19 s for 6 iterations) is not broken down yet.
+  compilations, opt-in persistent cache), D-047 (threaded host builds) and D-048 (one grid plan per geometry, no
+  serial zero fill), measured on the A100: a second Si 512 geometry costs 52.6 s. The sparse pattern is still NumPy
+  and the largest item (17 s), then the host two-centre set-up and force terms (11 s); 6 SCF iterations of real work
+  are 12 s.
 - **Host-side work left in the forces:** two-centre derivatives (0.32 s at 64 atoms) are now the largest stage.
 - **Meta-GGA XC on the host:** Libxc meta-GGA still runs on the host, now threaded (D-047).
 - **Plan limits:** `int32` value offsets cap a grid plan at 2^31 orbital values (about 2800 Si atoms); the host plan

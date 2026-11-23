@@ -277,3 +277,13 @@
   (9.7 s warm cache), second geometry 19.7 s -> 6.7 s; r2SCAN 50.3 s -> 15.7 s; Si 512 PBE 182 s -> 98 s (69 s warm),
   second geometry 139 s -> 65 s; energies identical to 1e-12 Ha.
 
+### 2026-11-23 — Per-geometry cost breakdown and host grid plans (D-048) (Claude Code)
+- A100 job 29634256: stage breakdown of a second Si 512 geometry (64.8 s): host grid plans 21.3 s (value plan in the
+  SCF, gradient plan in the forces, uploads), pattern 15.9 s, host two-centre set-up and force terms 11.5 s,
+  diagonalisation 6.4 s, grid Hamiltonian 5.6 s.
+- A100 job 29635520: plan build phases; 4.8 s of each 512-atom build was a serial zero fill of the per-entry array.
+- D-048: uninitialised plan arrays with threaded zeroing; the plan cache builds the richest variant requested for the
+  system, so one plan serves the SCF and the forces of a geometry.
+- A100 job 29635599: 26 CUDA and compilation tests pass; second geometry Si 512 PBE 64.8 s -> 52.6 s, Si 64 6.7 s ->
+  5.1 s; energies identical; 55 laptop grid/SCF/force tests pass.
+
