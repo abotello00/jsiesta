@@ -35,6 +35,7 @@ from jax_siesta.core.types import Observables, SCFConfig
 from jax_siesta.grid.mesh import choose_mesh_dimensions
 from jax_siesta.integrals.two_center import TwoCenterEvaluator
 from jax_siesta.io.fdf import load_case_json, observables_to_validation_dict
+from jax_siesta.io.siesta_files import read_dm, read_nc_restart, structure_from_xv, write_restart_files
 from jax_siesta.observables.forces import StaticObservableEvaluator
 from jax_siesta.scf.driver import build_monkhorst_pack_mesh, run_scf
 from jax_siesta.species.psml import PSMLBasisLoader, build_sparse_pattern
@@ -47,6 +48,12 @@ def run_single_point(
     case_path: str | Path,
     psml_dir: str | Path | None = None,
     config_overrides: dict | None = None,
+    read_xv_path: str | Path | None = None,
+    read_dm_path: str | Path | None = None,
+    read_nc_path: str | Path | None = None,
+    write_restart_dir: str | Path | None = None,
+    system_label: str | None = None,
+    restart_formats: tuple[str, ...] = ("XV", "DM", "nc"),
 ) -> Observables:
     r"""Execute an end-to-end static single-point KS-DFT calculation for ``case.json``.
 
@@ -57,12 +64,20 @@ def run_single_point(
     Algorithm:
         Wires together ``PSMLBasisLoader``, ``TwoCenterEvaluator``, ``run_scf``,
         and ``StaticObservableEvaluator`` (activating ``NativeSymmetryEngine`` when
-        ``config.use_symmetry`` is ``True``).
+        ``config.use_symmetry`` is ``True``). SIESTA restart files are optional at both ends: an ``.XV``
+        file replaces the geometry of the case, a ``.DM`` file and/or a ``.nc`` file (``DM`` and ``H``) warm-start
+        the SCF, and ``<label>.XV``, ``<label>.DM`` and ``<label>.nc`` are written from the final state.
 
     Parameters:
         case_path: Path to ``case.json``.
         psml_dir: Directory containing ``<Element>.psml`` (defaults to ``tests/fixtures/psml``).
         config_overrides: Optional dictionary of ``SCFConfig`` field overrides.
+        read_xv_path: SIESTA ``.XV`` file whose cell and positions replace those of the case.
+        read_dm_path: SIESTA ``.DM`` file used as the initial density matrix.
+        read_nc_path: SIESTA ``.nc`` file; its ``H`` (and its ``DM`` unless ``read_dm_path`` is given) start the SCF.
+        write_restart_dir: Directory for the restart files of the final state (not written when ``None``).
+        system_label: ``SystemLabel`` of the files written (defaults to the case name).
+        restart_formats: Subset of ``("XV", "DM", "nc")`` to write.
 
     Returns:
         Provenanced ``Observables`` PyTree.
@@ -78,6 +93,8 @@ def run_single_point(
     config: SCFConfig = case["config"]
     if config_overrides:
         config = replace(config, **config_overrides)
+    if read_xv_path is not None:
+        structure = structure_from_xv(read_xv_path, template=structure)
 
     if psml_dir is None:
         psml_dir = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures" / "psml"
@@ -109,6 +126,13 @@ def run_single_point(
         )
         two_center = TwoCenterEvaluator().evaluate(structure, basis, pattern, config)
 
+    initial_dm = None
+    initial_h = None
+    if read_nc_path is not None:
+        initial_dm, initial_h, _ = read_nc_restart(read_nc_path, pattern, config.nspin)
+    if read_dm_path is not None:
+        initial_dm = read_dm(read_dm_path, pattern, config.nspin)
+
     scf_state, mesh_shape = run_scf(
         structure,
         basis,
@@ -118,6 +142,8 @@ def run_single_point(
         config,
         mesh_shape=mesh_shape,
         sym_proj=sym_proj,
+        initial_dm=initial_dm,
+        initial_h=initial_h,
     )
     obs = StaticObservableEvaluator().evaluate(
         structure,
@@ -135,6 +161,21 @@ def run_single_point(
             obs,
             active_symmetry_ops=sym_proj.n_ops,
             magnetic_subgroup=sym_proj.subgroup_label,
+        )
+    if write_restart_dir is not None:
+        write_restart_files(
+            write_restart_dir,
+            system_label or str(case["name"]),
+            structure,
+            basis,
+            pattern,
+            two_center.overlap,
+            scf_state,
+            config,
+            forces_ha_per_bohr=obs.forces_ha_per_bohr,
+            stress_ha_per_bohr3=obs.stress_ha_per_bohr3,
+            k_grid=case["k_grid"],
+            formats=restart_formats,
         )
     return obs
 
@@ -161,6 +202,11 @@ def main() -> None:
     p.add_argument("--mode", default="candidate")
     p.add_argument("--psml-dir", type=Path, default=None)
     p.add_argument("--output", type=Path, default=Path("observables.json"))
+    p.add_argument("--read-xv", type=Path, default=None, help="SIESTA .XV file: start from its cell and positions")
+    p.add_argument("--read-dm", type=Path, default=None, help="SIESTA .DM file: warm-start density matrix")
+    p.add_argument("--read-nc", type=Path, default=None, help="SIESTA .nc file: warm-start Hamiltonian (and DM)")
+    p.add_argument("--write-restart", type=Path, default=None, help="directory for <label>.XV, .DM and .nc")
+    p.add_argument("--label", default=None, help="SystemLabel of the restart files (default: case name)")
     args = p.parse_args()
 
     overrides: dict = {}
@@ -173,7 +219,16 @@ def main() -> None:
 
     case = load_case_json(args.case_json)
     nspin = overrides.get("nspin", case["config"].nspin)
-    obs = run_single_point(args.case_json, psml_dir=args.psml_dir, config_overrides=overrides)
+    obs = run_single_point(
+        args.case_json,
+        psml_dir=args.psml_dir,
+        config_overrides=overrides,
+        read_xv_path=args.read_xv,
+        read_dm_path=args.read_dm,
+        read_nc_path=args.read_nc,
+        write_restart_dir=args.write_restart,
+        system_label=args.label,
+    )
     if not obs.converged:
         raise SystemExit(f"SCF did not converge: outcome={obs.outcome}")
 

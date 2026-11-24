@@ -57,6 +57,7 @@ from jax_siesta.grid.mesh import (
     vmat_differentiable,
     vmat_tau_differentiable,
 )
+from jax_siesta.io.siesta_files import normalize_dm
 from jax_siesta.scf.controller import update_adaptive_state
 from jax_siesta.scf.descriptors import recommend_scf_defaults
 from jax_siesta.scf.eigensolver import AssemblyPlan, GeneralizedEigenSolver, bloch_assembly_plan
@@ -165,6 +166,20 @@ def build_h0_sparse(two_center: TwoCenterMatrices, nspin: int) -> jax.Array:
     t_c = two_center.kinetic.astype(jnp.complex128)
     vso = two_center.v_kb_so
     return jnp.stack([t_c + vso[0], t_c + vso[1], jnp.real(vso[2]).astype(jnp.complex128), jnp.imag(vso[2]).astype(jnp.complex128)], axis=0)
+
+
+def _as_restart_matrix(matrix: jax.Array, pattern: SparsePattern, nspin: int, kind: str) -> jax.Array:
+    """Check the shape of a warm-start matrix and give it the dtype the SCF loop uses for this spin mode."""
+    n_ch = 1 if nspin == 1 else (2 if nspin == 2 else 4)
+    arr = jnp.asarray(matrix)
+    if arr.shape != (n_ch, pattern.n_edges):
+        raise ValueError(
+            f"Warm-start {kind} has shape {arr.shape}; nspin={nspin} on this pattern needs {(n_ch, pattern.n_edges)}."
+        )
+    want_complex = nspin == 8 or (nspin == 4 and kind == "dm")
+    if want_complex:
+        return arr.astype(jnp.complex128)
+    return jnp.real(arr).astype(jnp.float64)
 
 
 @partial(jax.jit, static_argnames=("mesh_shape", "nspin", "seed_functional", "with_tau_core", "n_edges", "sym"))
@@ -414,6 +429,8 @@ def run_scf(
     config: SCFConfig,
     mesh_shape: tuple[int, int, int] | None = None,
     sym_proj: SymmetryProjector | None = None,
+    initial_dm: jax.Array | None = None,
+    initial_h: jax.Array | None = None,
 ) -> tuple[SCFState, tuple[int, int, int]]:
     r"""Execute the adaptive static SCF cycle until convergence or iteration cap.
 
@@ -428,6 +445,13 @@ def run_scf(
         ``solve -> symmetrize -> grid_potential -> residual -> controller -> mix``,
         and returns the final ``SCFState`` holding unmixed ``dm_out`` and ``edm_out``.
 
+        Warm start. ``initial_dm`` (e.g. from ``jax_siesta.io.read_dm``) replaces the cold-start density matrix;
+        it is rescaled to the electron count and symmetry-projected, and the first Hamiltonian is ``H[D]`` as in
+        a SIESTA restart. ``initial_h`` (e.g. from ``jax_siesta.io.read_nc_restart``) is used as the first input
+        Hamiltonian when ``mix_target == "Hamiltonian"``; without ``initial_dm`` the starting density matrix is
+        the one it produces (one extra diagonalisation). Under density-matrix mixing the first Hamiltonian is
+        always ``H[D_in]``, so ``initial_h`` only serves to build ``D_in`` when no ``initial_dm`` is given.
+
     Parameters:
         structure: ``Structure`` PyTree.
         basis: ``BasisData`` PyTree.
@@ -437,6 +461,8 @@ def run_scf(
         config: ``SCFConfig`` hyperparameters.
         mesh_shape: Optional explicit 3D mesh shape (defaults to ``choose_mesh_dimensions``).
         sym_proj: Optional ``SymmetryProjector`` (used in Phase 2).
+        initial_dm: Optional warm-start density matrix ``(n_spin_mat, n_edges)`` on ``pattern``.
+        initial_h: Optional warm-start Hamiltonian ``(n_spin_mat, n_edges)`` in Hartree on ``pattern``.
 
     Returns:
         Tuple ``(final_scf_state, mesh_shape)``.
@@ -492,7 +518,7 @@ def run_scf(
     packed_basis = _pack_basis_grid_buffers(basis, pattern)
     sym_static = _StaticByIdentity(sym_proj) if sym_proj is not None else None
 
-    # Cold start: diagonalise H0 + V_xc[rho_NA] + V_NA (+ an on-site Zeeman seed for magnetic runs).
+    # Neutral-atom grids and the cold-start seed H0 + V_xc[rho_NA] + V_NA (the grids are needed by warm starts too).
     h_init, rho_na, v_na, rho_core, tau_core = _seed_grids_and_hamiltonian(
         structure.positions,
         structure.cell,
@@ -506,14 +532,28 @@ def run_scf(
         n_edges=n_edges,
         sym=sym_static,
     )
-    zeeman = _zeeman_seed(structure, basis, pattern, two_center.overlap, config.nspin)
-    if zeeman is not None:
-        h_init = h_init.at[0].add(jnp.asarray(zeeman[0]))
-        h_init = h_init.at[1].add(jnp.asarray(-zeeman[0]))
-        if config.nspin in (4, 8):
-            h_init = h_init.at[2].add(jnp.asarray(zeeman[1]))
-            h_init = h_init.at[3].add(jnp.asarray(-zeeman[2]))
-    dm_init = solve_jit(h_init, config.electronic_temp_ha, s_transform)[0]
+    if initial_h is not None:
+        initial_h = _as_restart_matrix(initial_h, pattern, config.nspin, "h")
+        if sym_proj is not None:
+            initial_h = sym_proj.project_matrix(initial_h, config.nspin)
+    if initial_dm is not None:
+        # Warm start from a stored density matrix, rescaled to the electron count.
+        dm_init = normalize_dm(
+            _as_restart_matrix(initial_dm, pattern, config.nspin, "dm"), two_center.overlap, n_electrons, config.nspin
+        )
+    elif initial_h is not None:
+        # Warm start from a stored Hamiltonian alone: the starting density matrix is the one it produces.
+        dm_init = solve_jit(initial_h.astype(h0.dtype), config.electronic_temp_ha, s_transform)[0]
+    else:
+        # Cold start: diagonalise the seed (+ an on-site Zeeman term for magnetic runs).
+        zeeman = _zeeman_seed(structure, basis, pattern, two_center.overlap, config.nspin)
+        if zeeman is not None:
+            h_init = h_init.at[0].add(jnp.asarray(zeeman[0]))
+            h_init = h_init.at[1].add(jnp.asarray(-zeeman[0]))
+            if config.nspin in (4, 8):
+                h_init = h_init.at[2].add(jnp.asarray(zeeman[1]))
+                h_init = h_init.at[3].add(jnp.asarray(-zeeman[2]))
+        dm_init = solve_jit(h_init, config.electronic_temp_ha, s_transform)[0]
     if sym_proj is not None:
         dm_init = sym_proj.project_matrix(dm_init, config.nspin)
 
@@ -550,6 +590,9 @@ def run_scf(
     h_in = h0 + h_grid_0.astype(h0.dtype)
     if sym_proj is not None:
         h_in = sym_proj.project_matrix(h_in, config.nspin)
+    if initial_h is not None and config.mix_target == "Hamiltonian":
+        # Warm start from a stored Hamiltonian: it is the first H_in (D_in stays the density paired with it).
+        h_in = initial_h.astype(h0.dtype)
 
     # Note for nspin=8, mixer works on real float64 channels while preserving imag(H_uu, H_dd) from H0_SO
     h_so_imag = jnp.imag(h0[:2]) if jnp.iscomplexobj(h0) else None

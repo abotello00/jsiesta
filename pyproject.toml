@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dispersion = ["dftd3>=1.7"]
+netcdf = ["netCDF4>=1.6"]
 
 [build-system]
 requires = ["setuptools>=68"]

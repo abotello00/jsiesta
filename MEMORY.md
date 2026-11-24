@@ -4,7 +4,7 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-24 (D-046 to D-048 on `perf/fixed-costs`, D-049 on `perf/basis-opt`)
+- **Last updated:** 2026-11-24 (D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
@@ -42,6 +42,7 @@
 - **SIESTA mesh criterion:** validated — `test_siesta_mesh_selection_matches_siesta` (15 cells, `criterion="siesta"`, D-020); the default since D-027 (`"jsiesta"` is the legacy option)
 - **Fully relativistic PSML below nspin 8:** validated — `test_fully_relativistic_psml_below_nspin8_matches_siesta` (H2O, triclinic Si; same projector set as SIESTA, D-028)
 - **Frozen spin axis (non-collinear GGA derivative):** bounded — `test_noncollinear_xc_derivative_with_frozen_spin_axis` (LDA exact, PBE <= 7e-5 relative on a spin spiral; D-026)
+- **SIESTA restart files (`.XV`, `.DM`, `.nc`; D-051):** partially — formats byte-identical to SIESTA-written files (`test_siesta_written_dm_and_xv_are_reproduced_byte_for_byte`, needs a SIESTA source tree); spin conventions against a transcription of `diag3k`, round trips and warm starts are self-consistency tests (`tests/test_siesta_files.py`); the exchange with a running SIESTA (`test_siesta_reads_jsiesta_files_and_jsiesta_reads_siesta_files`) has not been run yet
 - **KG verification status:** from JUnit results since D-019 (`make kg-results`); `resume_session_context` separates verified (external reference passed), self-consistent only, failing, skipped and never run
 
 ## Upstream issues found (reported here, not fixed upstream)
@@ -74,6 +75,9 @@
   must fit in host memory.
 - **SIESTA re-measurement:** SIESTA timings come from shared nodes with `DirectPhi .false.`; an exclusive-node run
   with ELPA is still open.
+- **Restart-file exchange with SIESTA not measured:** `test_siesta_reads_jsiesta_files_and_jsiesta_reads_siesta_files`
+  needs `siesta_bin` and `pseudodojo_sr_pbe_dir`; it has never run. `nspin` 4 and 8 file conventions are checked only
+  against a transcription of `diag3k`.
 - **A100 reference replay:** the SIESTA-parity tests have not been replayed on the GPU against a reference cache
   (`make refs-cache`).
 

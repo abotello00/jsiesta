@@ -22,6 +22,7 @@ neutral-atom potential and a uniform real-space grid. Every physics term is chec
 | SCF | Tikhonov–Pulay, Broyden and ADIIS mixers, adaptive trust-region controller, mandatory post-SCF `DM_out` evaluation, Harris energy |
 | Observables | Forces and stress at fixed (D, E) by automatic differentiation of the discrete energy, Mulliken moments |
 | Basis | SIESTA `.ion` import, PAO generator, basis-enthalpy optimiser |
+| Restart files | SIESTA `.XV`, `.DM` and `.nc` (`CDF.Save`) read and written: start from a SIESTA geometry, density matrix or Hamiltonian, and leave files SIESTA can continue from |
 | GPU | CUDA kernels for the orbital–grid operations and their adjoints, device LDA/GGA XC, grid plans streamed from host memory when they do not fit |
 
 The validation status of each item, with the test that checks it against an external reference, is kept in
@@ -39,7 +40,7 @@ jax_siesta/          Python/JAX package
   symmetry/          spglib wrapper, Wigner-D, density-matrix projection, grid symmetrisation
   scf/               eigensolver, mixers, adaptive controller, SCF driver
   observables/       post-SCF pass, energies, forces and stress
-  io/                FDF subset, case.json, observables.json
+  io/                FDF subset, case.json, observables.json, SIESTA restart files (.XV, .DM, .nc)
   testing/           SIESTA adapters, external references, physical-identity checks, profiling
 cpp/                 C++ (include/, src/) and CUDA (cuda/) kernels behind the XLA FFI
 kg/                  knowledge-graph builder and read-only MCP server
@@ -64,6 +65,40 @@ make check         # ruff, mypy, Doxygen + Sphinx -W, knowledge graph, pytest wi
 JAX_ENABLE_X64=True .venv/bin/python jax_siesta/testing/run_case.py \
     tests/manifests/cases/si_bulk/case.json --psml-dir tests/fixtures/psml
 ```
+
+## Restart files (SIESTA `.XV`, `.DM`, `.nc`)
+
+`jax_siesta.io` reads and writes the three files SIESTA uses to continue a calculation, converting the sparsity
+layout (supercell column indices), the spin components and the units (Ry) in both directions.
+
+```bash
+# write <label>.XV, <label>.DM and <label>.nc from the final state
+JAX_ENABLE_X64=True .venv/bin/python jax_siesta/testing/run_case.py case.json --write-restart out --label si
+
+# start from them: geometry from the .XV, density matrix from the .DM, Hamiltonian from the .nc
+JAX_ENABLE_X64=True .venv/bin/python jax_siesta/testing/run_case.py case.json \
+    --read-xv out/si.XV --read-dm out/si.DM --read-nc out/si.nc
+```
+
+```python
+from jax_siesta.io import read_dm, read_nc_restart, structure_from_xv, write_restart_files
+
+structure = structure_from_xv("si.XV", template=structure)       # cell and positions from SIESTA
+dm0 = read_dm("si.DM", pattern, config.nspin)                    # any nsc, any sparsity pattern, any spin mode
+dm0, h0, ef = read_nc_restart("si.nc", pattern, config.nspin)    # DM and H (Hartree) from a CDF.Save file
+state, mesh = run_scf(structure, basis, pattern, two_center, kmesh, config, initial_dm=dm0, initial_h=h0)
+write_restart_files("out", "si", structure, basis, pattern, two_center.overlap, state, config)
+```
+
+| File | jsiesta reads | jsiesta writes | SIESTA reads it with |
+|---|---|---|---|
+| `<label>.XV` | cell and positions (species data from the input structure) | yes, zero velocities | `MD.UseSaveXV T` |
+| `<label>.DM` | initial density matrix, rescaled to the electron count | yes | `DM.UseSaveDM T` / `File.DM.Init` |
+| `<label>.nc` | `H` (first input Hamiltonian), `DM`, geometry | yes: geometry, `S`, `H`, `DM`, `EDM`, `Ef`, forces, stress | not as a restart: SIESTA has no reader for `H`; sisl and other tools read it |
+
+The species index in the `.XV` file is the position of the species in `structure.species_labels`, so the SIESTA input
+must list `ChemicalSpeciesLabel` in that order; both codes must use the same basis (SIESTA's `.ion` tables). The
+`.nc` file needs the optional `netCDF4` package (`pip install .[netcdf]`).
 
 For the GPU build, configure with `cmake -S cpp -B cpp/build -DJSIESTA_USE_LIBXC=ON -DJSIESTA_ENABLE_CUDA=ON`
 (CUDA 12). It runs the same algorithms as the CPU build; `tests/test_phase3_cuda.py` checks the two against each

@@ -20,6 +20,8 @@ flowchart LR
     core --> io
     io.fdf["jax_siesta.io.fdf"]
     core --> io.fdf
+    io.siesta_files["jax_siesta.io.siesta_files"]
+    core --> io.siesta_files
     observables["jax_siesta.observables"]
     core --> observables
     observables.forces["jax_siesta.observables.forces"]

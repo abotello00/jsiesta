@@ -218,6 +218,14 @@ def extract_python_entities(repo_root: Path) -> tuple[list[dict], dict[str, str]
                             "has_required_docs": has_docs,
                         })
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+                # typing.overload stubs share the implementation's name; only
+                # the implementation is an entity.
+                if any(
+                    (isinstance(d, ast.Name) and d.id == "overload")
+                    or (isinstance(d, ast.Attribute) and d.attr == "overload")
+                    for d in node.decorator_list
+                ):
+                    continue
                 fdoc = ast.get_docstring(node) or ""
                 fsec = _parse_docstring_sections(fdoc)
                 args_str = ast.unparse(node.args)
