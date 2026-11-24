@@ -27,6 +27,7 @@ SIESTA Mapping:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
 from typing import Any
@@ -435,6 +436,7 @@ def run_scf(
     sym_proj: SymmetryProjector | None = None,
     initial_dm: jax.Array | None = None,
     initial_h: jax.Array | None = None,
+    callback: Callable[[dict[str, float]], None] | None = None,
 ) -> tuple[SCFState, tuple[int, int, int]]:
     r"""Execute the adaptive static SCF cycle until convergence or iteration cap.
 
@@ -467,6 +469,9 @@ def run_scf(
         sym_proj: Optional ``SymmetryProjector`` (used in Phase 2).
         initial_dm: Optional warm-start density matrix ``(n_spin_mat, n_edges)`` on ``pattern``.
         initial_h: Optional warm-start Hamiltonian ``(n_spin_mat, n_edges)`` in Hartree on ``pattern``.
+        callback: Optional function called once per iteration with a dictionary of floats: ``iteration``
+            (from 1), ``free_energy_ha``, ``harris_energy_ha``, ``fermi_level_ha``, ``d_max``, ``h_max_ha`` and
+            ``energy_change_ha``. It is for progress reports and convergence histories; it cannot change the run.
 
     Returns:
         Tuple ``(final_scf_state, mesh_shape)``.
@@ -679,6 +684,18 @@ def run_scf(
             harris_energy_ha=harris_e,
             harris_provenance=harris_provenance,
         )
+        if callback is not None:
+            callback(
+                {
+                    "iteration": float(state.iteration),
+                    "free_energy_ha": float(free_e_scf),
+                    "harris_energy_ha": float(harris_e),
+                    "fermi_level_ha": float(mu_f),
+                    "d_max": d_max,
+                    "h_max_ha": h_max,
+                    "energy_change_ha": e_diff,
+                }
+            )
         if outcome == "numerical_breakdown":
             return state, mesh_shape
         if converged:

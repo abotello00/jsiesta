@@ -53,10 +53,19 @@ from jax_siesta.core.types import (
     Structure,
 )
 
+__version__ = "0.1.0"
+
 enable_compilation_cache()  # no-op unless JSIESTA_COMPILATION_CACHE names a directory
+
+# High-level interface (imported last: it uses the stage modules above).
+from jax_siesta.app.calculation import BandStructure, Calculation, Results, make_structure  # noqa: E402
 
 __all__ = [
     "BOHR_TO_ANGSTROM",
+    "BandStructure",
+    "Calculation",
+    "Results",
+    "make_structure",
     "HARTREE_TO_EV",
     "HARTREE_TO_RY",
     "BasisAndPseudos",

@@ -1,0 +1,33 @@
+# Oxygen molecule: spin-polarised calculation of the triplet ground state.
+# Run:  jsiesta o2.fdf --pseudo-dir ../pseudos > o2.out
+
+SystemName   Oxygen molecule (triplet)
+SystemLabel  o2
+
+%block ChemicalSpeciesLabel
+  1  8  O
+%endblock ChemicalSpeciesLabel
+
+LatticeConstant  7.0 Ang
+%block LatticeVectors
+  1.0  0.0  0.0
+  0.0  1.0  0.0
+  0.0  0.0  1.0
+%endblock LatticeVectors
+
+AtomicCoordinatesFormat  Ang
+%block AtomicCoordinatesAndAtomicSpecies
+  3.500  3.500  2.895  1
+  3.500  3.500  4.105  1
+%endblock AtomicCoordinatesAndAtomicSpecies
+
+Spin  polarized
+%block DM.InitSpin        # start with one unpaired electron on each atom
+  1  +1.0
+  2  +1.0
+%endblock DM.InitSpin
+
+PAO.BasisSize  DZP
+XC.Functional  GGA
+XC.Authors     PBE
+MeshCutoff     150 Ry

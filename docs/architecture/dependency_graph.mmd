@@ -1,5 +1,19 @@
 flowchart LR
     core["jax_siesta.core"]
+    __main__["jax_siesta.__main__"]
+    core --> __main__
+    app["jax_siesta.app"]
+    core --> app
+    app.basis["jax_siesta.app.basis"]
+    core --> app.basis
+    app.calculation["jax_siesta.app.calculation"]
+    core --> app.calculation
+    app.cli["jax_siesta.app.cli"]
+    core --> app.cli
+    app.outputs["jax_siesta.app.outputs"]
+    core --> app.outputs
+    app.report["jax_siesta.app.report"]
+    core --> app.report
     core.compilation["jax_siesta.core.compilation"]
     core --> core.compilation
     core.ffi["jax_siesta.core.ffi"]
@@ -24,6 +38,8 @@ flowchart LR
     core --> io.siesta_files
     observables["jax_siesta.observables"]
     core --> observables
+    observables.bands["jax_siesta.observables.bands"]
+    core --> observables.bands
     observables.forces["jax_siesta.observables.forces"]
     core --> observables.forces
     scf["jax_siesta.scf"]

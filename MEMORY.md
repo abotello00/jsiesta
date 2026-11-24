@@ -4,15 +4,27 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-24 (D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files, D-052 projection table and test memory)
+- **Last updated:** 2026-11-24 (D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files, D-052 projection table and test memory, D-053 user interface and documentation)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
 
+## User interface (D-053)
+
+- `jsiesta in.fdf [--pseudo-dir DIR] [--check]` (also `python -m jax_siesta`, or the input on standard input) runs a
+  SIESTA input with `<Label>.psml` files; Python: `jax_siesta.Calculation.from_fdf(...).run()` -> `Results` (eV, Ang).
+  Code in `jax_siesta/app`; keywords in `docs/user_guide/fdf_reference.rst`; unused labels are reported.
+- The basis is generated from the PSML file by default (Tier B generator); `User.Basis T` reads SIESTA's `.ion.xml`.
+  Hydrogen needs `PAO.SplitNormH 0.5`.
+- Documentation site: `docs/` (Getting started, User guide, Tutorials, API by section, Theory, Development).
+  Tutorials: `docs/tutorials/*.py` + executed `*.ipynb` (`make tutorials`, about 12 minutes on the laptop).
+  Examples and PseudoDojo PSML files (H, C, O, Si): `examples/`.
+
 ## Environment
 
 - `.venv` (Python 3.11) from `requirements-dev.txt`: jax/jaxlib 0.4.38, numpy 2.2.6, scipy 1.14.1, spglib 2.8.0,
-  mcp 1.27, sphinx 8.2.3, ruff 0.15.7, mypy 2.4.1, dftd3 1.7.0 (optional extra `[dispersion]`).
+  mcp 1.27, sphinx 8.2.3, ruff 0.15.7, mypy 2.4.1, dftd3 1.7.0 (optional extra `[dispersion]`), myst-nb 1.4.0,
+  jupytext 1.19.7, matplotlib 3.11.2 (documentation notebooks). The package is installed in editable mode (`jsiesta` script).
 - `make ffi` builds `cpp/build/libjsiesta_ffi` with static Libxc from `/opt/etsf` (`JSIESTA_USE_LIBXC=ON`).
 - External references: keys in `tests/external_refs.toml` (empty; set them in `tests/external_refs.local.toml` or `JSIESTA_<KEY>`):
   standard SIESTA 5.4.2, `siesta_spglib_full_impl`, `pr_mgga` SIESTA, SIESTA `Tests/Pseudos`, `pr_mgga` Tests, the SIESTA documentation index,
@@ -43,6 +55,11 @@
 - **Fully relativistic PSML below nspin 8:** validated — `test_fully_relativistic_psml_below_nspin8_matches_siesta` (H2O, triclinic Si; same projector set as SIESTA, D-028)
 - **Frozen spin axis (non-collinear GGA derivative):** bounded — `test_noncollinear_xc_derivative_with_frozen_spin_axis` (LDA exact, PBE <= 7e-5 relative on a spin spiral; D-026)
 - **SIESTA restart files (`.XV`, `.DM`, `.nc`; D-051):** partially — formats byte-identical to SIESTA-written files (`test_siesta_written_dm_and_xv_are_reproduced_byte_for_byte`, needs a SIESTA source tree); spin conventions against a transcription of `diag3k`, round trips and warm starts are self-consistency tests (`tests/test_siesta_files.py`); the exchange with a running SIESTA (`test_siesta_reads_jsiesta_files_and_jsiesta_reads_siesta_files`) has not been run yet
+- **User interface (`jax_siesta.app`, D-053):** self-consistency and identity tests only — `tests/test_app_interface.py`
+  (eigenvalues vs dense SciPy solution 1e-8 eV, electron count, force vs finite difference 1.1e-5 eV/Ang at 200 Ry,
+  file round trips, restart, exit codes). Not validated against SIESTA: `test_same_fdf_input_in_siesta_and_jsiesta`
+  (needs `siesta_bin`) has never run; `.FA`/`.EIG`/`.bands` layouts follow the SIESTA sources but were not compared
+  with SIESTA-written files
 - **KG verification status:** from JUnit results since D-019 (`make kg-results`); `resume_session_context` separates verified (external reference passed), self-consistent only, failing, skipped and never run
 
 ## Upstream issues found (reported here, not fixed upstream)
@@ -80,6 +97,14 @@
   against a transcription of `diag3k`.
 - **A100 reference replay:** the SIESTA-parity tests have not been replayed on the GPU against a reference cache
   (`make refs-cache`).
+
+- **Native-basis runs vs SIESTA not measured (D-053):** the same `.fdf` + PSML in both codes
+  (`test_same_fdf_input_in_siesta_and_jsiesta`), and the SIESTA-format text files against SIESTA's own.
+- **Mesh noise with ONCV pseudopotentials (D-053):** forces move by 0.02 eV/Ang between 150 and 200 Ry for displaced
+  Si; SIESTA's remedy (grid-cell sampling) is not implemented.
+- **Automatic polarisation shell:** the generator polarises the highest-`l` valence shell; SIESTA's choice for
+  elements with d or semicore valence states may differ (not compared).
+- **Generated orbitals are normalised to 1 + 1e-4** after tabulation on the uniform grid (D-053).
 
 ## Next steps
 

@@ -5,6 +5,7 @@
 #   make lint      ruff
 #   make typecheck mypy on jax_siesta/ and kg/
 #   make docs      doxygen + sphinx -W (warnings are errors)
+#   make tutorials convert docs/tutorials/*.py to notebooks and execute them (needs `make ffi`; ~12 minutes)
 #   make kg        rebuild and atomically publish kg/current (also refreshes docs/architecture)
 #   make test      full pytest suite, JUnit XML in reports/pytest.junit.xml
 #   make test-refs same, but missing SIESTA references fail instead of skip
@@ -19,11 +20,12 @@ REPORTS := reports
 REFS_CACHE_TESTS := tests/test_siesta_parity.py tests/test_na_pair_exact.py tests/test_dispersion.py::test_d3_matches_siesta \
     tests/test_mgga_soc.py::test_pr_mgga_si_bulk_noncol_and_soc_parity
 
-.PHONY: venv ffi lint typecheck docs kg kg-results test test-refs refs-cache check clean
+.PHONY: venv ffi lint typecheck docs tutorials kg kg-results test test-refs refs-cache check clean
 
 venv:
 	uv venv --python 3.11 .venv
 	uv pip install --python $(PY) -r requirements-dev.txt
+	uv pip install --python $(PY) --no-deps -e .
 
 ffi:
 	cmake -S cpp -B cpp/build -DJSIESTA_USE_LIBXC=ON
@@ -38,6 +40,16 @@ typecheck:
 docs:
 	doxygen docs/Doxyfile > /dev/null
 	$(PY) -m sphinx -W -q -b html docs docs/_build/html
+
+# The tutorials are written as "percent" scripts (# %% cells). Each is converted to a notebook and executed, so the
+# notebooks in the documentation always show real output. Commit the .py and the .ipynb together.
+VENV_BIN := $(abspath $(dir $(PY)))
+tutorials:
+	cd docs/tutorials && for f in [0-9]*.py; do \
+	    echo "== $$f"; \
+	    $(VENV_BIN)/jupytext --quiet --to ipynb --set-kernel python3 $$f && \
+	    PATH="$(VENV_BIN):$$PATH" $(VENV_BIN)/jupyter-execute --inplace --timeout=3600 $${f%.py}.ipynb || exit 1; \
+	done
 
 kg: docs
 	$(PY) kg/build_kg.py
@@ -64,4 +76,4 @@ refs-cache:
 check: lint typecheck kg test kg-results
 
 clean:
-	rm -rf docs/_build docs/_doxygen docs/_generated .pytest_cache .mypy_cache .ruff_cache
+	rm -rf docs/_build docs/_doxygen docs/_generated docs/tutorials/work .pytest_cache .mypy_cache .ruff_cache

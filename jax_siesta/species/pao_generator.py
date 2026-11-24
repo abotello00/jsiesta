@@ -64,6 +64,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Literal
 import xml.etree.ElementTree as ET
 
@@ -754,28 +755,28 @@ def _adjust_occupations_for_charge(
 def default_basis_spec(
     symbol: str,
     shells_occ: list[tuple[int, int, float]],
-    basis_size: Literal["SZ", "DZ", "DZP"] = "DZP",
+    basis_size: str = "DZP",
     xc: str = "PBE",
     energy_shift_ha: float = 0.01 * RY_TO_HARTREE,
     split_norm: float = 0.15,
 ) -> SpeciesBasisSpec:
-    """Build a standard SIESTA-like ``SZ``, ``DZ``, or ``DZP`` :class:`SpeciesBasisSpec`.
+    """Build a standard SIESTA-like :class:`SpeciesBasisSpec` from a basis-size name (``SZ`` ... ``QZ2P``).
 
     Theory:
-        Maps SIESTA standard basis sizes (single-zeta ``SZ``, double-zeta ``DZ``, and
-        double-zeta polarized ``DZP``) onto explicit per-shell specifications using
-        ``PAO.EnergyShift`` and perturbative polarization of the highest angular momentum
+        Maps SIESTA standard basis sizes (``SZ``, ``DZ``, ``TZ``, ``QZ``, optionally followed by ``P`` or
+        ``<n>P`` for polarisation, e.g. ``SZP``, ``DZP``, ``TZP``, ``TZ2P``) onto explicit per-shell
+        specifications using ``PAO.EnergyShift`` and perturbative polarization of the highest angular momentum
         occupied valence shell.
 
     Algorithm:
-        Constructs valence shells with ``n_zeta = 1`` (``SZ``) or ``2`` (``DZ``/``DZP``)
-        and appends a perturbative polarization shell ``l_pol = max(l) + 1`` when
-        ``basis_size == "DZP"``.
+        Constructs valence shells with ``n_zeta`` = 1, 2, 3 or 4 and, for the ``P`` sizes, appends a perturbative
+        polarization shell ``l_pol = max(l) + 1`` with as many zetas as the number before ``P`` (default 1).
 
     Parameters:
         symbol: Element symbol.
         shells_occ: Occupied valence ``(n, l, occ)`` tuples.
-        basis_size: Preset tier (``"SZ"``, ``"DZ"``, or ``"DZP"``).
+        basis_size: Preset tier: ``"SZ"``, ``"DZ"``, ``"TZ"`` or ``"QZ"``, plus ``"P"`` or ``"2P"``...; SIESTA's
+            aliases ``MINIMAL`` (= ``SZ``) and ``STANDARD`` (= ``DZP``) are accepted.
         xc: XC functional identifier for atomic screening.
         energy_shift_ha: Confinement energy shift (default ``0.005 Ha = 0.01 Ry``).
         split_norm: Tail-norm parameter for default inner-zeta determination.
@@ -784,12 +785,17 @@ def default_basis_spec(
         Configured :class:`SpeciesBasisSpec`.
 
     Invariants:
-        - ``DZP`` adds one perturbative polarization shell with ``l = max(l) + 1``.
+        - A ``P`` size adds one perturbative polarization shell with ``l = max(l) + 1``.
 
     SIESTA Mapping:
         Mirrors ``PAO.BasisSize SZ/DZ/DZP`` defaults in SIESTA ``basis_specs.f``.
     """
-    n_z = 1 if basis_size.upper() == "SZ" else 2
+    size = {"MINIMAL": "SZ", "STANDARD": "DZP"}.get(basis_size.upper(), basis_size.upper())
+    m_size = re.fullmatch(r"([SDTQ])Z(?:(\d?)P)?", size)
+    if m_size is None:
+        raise ValueError(f"Unknown basis size {basis_size!r}; expected SZ, DZ, TZ or QZ, optionally with P or <n>P.")
+    n_z = "SDTQ".index(m_size.group(1)) + 1
+    n_pol = 0 if m_size.group(2) is None else int(m_size.group(2) or 1)
     shell_specs = [
         ShellBasisSpec(
             n=n_q,
@@ -802,14 +808,14 @@ def default_basis_spec(
         for n_q, l_q, occ in shells_occ
         if occ > 0.0 or (n_q, l_q) in [(s[0], s[1]) for s in shells_occ]
     ]
-    if basis_size.upper() == "DZP":
+    if n_pol > 0:
         parent = max(shell_specs, key=lambda s: (s.l, s.n))
         if all(s.l != parent.l + 1 for s in shell_specs):
             shell_specs.append(
                 ShellBasisSpec(
                     n=parent.n,
                     l=parent.l + 1,
-                    n_zeta=1,
+                    n_zeta=n_pol,
                     rc_list=None,
                     is_polarization=True,
                     polarization_mode="perturbative",
@@ -828,9 +834,11 @@ def default_basis_spec(
 
 def generate_species_from_psml(
     psml_path: str | Path,
-    basis_spec: SpeciesBasisSpec | Literal["SZ", "DZ", "DZP"] = "DZP",
+    basis_spec: SpeciesBasisSpec | str = "DZP",
     xc: str = "PBE",
     n_pao_grid: int = 401,
+    energy_shift_ha: float = 0.01 * RY_TO_HARTREE,
+    split_norm: float = 0.15,
 ) -> tuple[SpeciesData, dict[str, Any]]:
     r"""Generate complete confined NAO ``SpeciesData`` directly from a ``.psml`` file.
 
@@ -851,9 +859,11 @@ def generate_species_from_psml(
     Parameters:
         psml_path: Path to ``.psml`` XML file.
         basis_spec: Either a full :class:`SpeciesBasisSpec` (explicit ``rc``, ``V0``, ``ri``, ``q``)
-            or preset string ``"SZ"``, ``"DZ"``, ``"DZP"``.
+            or a preset size accepted by :func:`default_basis_spec` (``"SZ"``, ``"DZP"``, ``"TZ2P"``...).
         xc: Reference XC functional (used when ``basis_spec`` is a preset string).
         n_pao_grid: Uniform radial grid size for ``SpeciesData.pao_r`` spline tables.
+        energy_shift_ha: ``PAO.EnergyShift`` of a preset size, in Hartree (default 0.01 Ry).
+        split_norm: ``PAO.SplitNorm`` of a preset size.
 
     Returns:
         Tuple ``(species_data, diagnostics)`` with orbital eigenvalues and cutoff metadata.
@@ -870,7 +880,9 @@ def generate_species_from_psml(
     z_val = float(parsed["z_val"])
     shells_occ = parsed["shells_occ"]
     if isinstance(basis_spec, str):
-        spec = default_basis_spec(parsed["symbol"], shells_occ, basis_size=basis_spec, xc=xc)
+        spec = default_basis_spec(
+            parsed["symbol"], shells_occ, basis_size=basis_spec, xc=xc, energy_shift_ha=energy_shift_ha, split_norm=split_norm
+        )
     else:
         spec = basis_spec
 

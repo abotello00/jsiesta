@@ -331,3 +331,26 @@
 - Open: `test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage` ran for 19 hours without finishing
   on the laptop before the merge and has not been run since.
 
+### 2026-11-24 — User interface, sectioned documentation, tutorials (D-053) (Claude Code)
+- Branch `feature/user-interface-docs`. New package `jax_siesta/app` (`Calculation`, `Results`, `jsiesta` command,
+  report, SIESTA-format outputs, basis and pseudopotential helpers); `parse_fdf` rewritten on `tokenize_fdf` with
+  SIESTA defaults and a report of unused labels; `run_scf(callback=)`, `band_energies`, basis sizes SZ..QZ2P,
+  `PAO.SplitNormH`.
+- Documentation site reorganised into Getting started, User guide, Tutorials, API reference (sections with
+  introductions, generated fragments), Theory, Development. Eight tutorials plus a solutions notebook
+  (`docs/tutorials`, scripts and executed notebooks; `make tutorials`). `examples/` with three inputs and
+  PseudoDojo PSML files for H, C, O, Si.
+- Environment: myst-nb 1.4.0, jupytext 1.19.7, nbclient 0.11.0, ipykernel 7.4.0, matplotlib 3.11.2 added to
+  `requirements-dev.txt` (51 pins); the package is installed in editable mode in `.venv` (`jsiesta` script).
+- Findings recorded in D-053: hydrogen needs `PAO.SplitNormH 0.5` (H2 bond 0.777 -> 0.748 Ang); mesh noise of
+  forces and pressure with the ONCV pseudopotentials; self-overlap 1 + 1e-4 of generated orbitals.
+- Open: run `test_same_fdf_input_in_siesta_and_jsiesta` and compare the `.FA`/`.EIG`/`.bands` files with SIESTA's
+  where a SIESTA binary is available; candidates for a next step are listed in the user guide page "Differences
+  from SIESTA" (relaxation driver, `kgrid.Cutoff`, PDOS).
+
+- Checks on the laptop: ruff, mypy, Doxygen + Sphinx `-W` and the knowledge-graph rebuild pass. Full suite in a 6 GB
+  scope (23 minutes, peak 4.6 GB): 168 passed, 47 skipped (no SIESTA binary or reference sets on this machine), 3
+  failed and then fixed and rerun (`jax_siesta/__main__.py` lacked the docstring sections, twice; the exact `io`
+  dictionary in `test_fdf_restart_keywords` gained `must_converge`).
+  `test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage` was deselected (see the entry above).
+  The JUnit file in `reports/` is from the run before those fixes; `make kg-results` was not rerun.

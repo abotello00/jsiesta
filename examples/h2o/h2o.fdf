@@ -1,0 +1,31 @@
+# Water molecule in a box (Gamma point), PBE, DZP basis.
+# Run:  jsiesta h2o.fdf --pseudo-dir ../pseudos > h2o.out
+
+SystemName   Water molecule
+SystemLabel  h2o
+
+NumberOfAtoms    3
+NumberOfSpecies  2
+%block ChemicalSpeciesLabel
+  1  8  O
+  2  1  H
+%endblock ChemicalSpeciesLabel
+
+LatticeConstant  8.0 Ang
+%block LatticeVectors
+  1.0  0.0  0.0
+  0.0  1.0  0.0
+  0.0  0.0  1.0
+%endblock LatticeVectors
+
+AtomicCoordinatesFormat  Ang
+%block AtomicCoordinatesAndAtomicSpecies
+  4.000  4.000  4.000  1
+  4.757  4.586  4.000  2
+  3.243  4.586  4.000  2
+%endblock AtomicCoordinatesAndAtomicSpecies
+
+PAO.BasisSize  DZP
+XC.Functional  GGA
+XC.Authors     PBE
+MeshCutoff     150 Ry

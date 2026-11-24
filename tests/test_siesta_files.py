@@ -413,7 +413,7 @@ def test_fdf_restart_keywords(tmp_path: Path) -> None:
     io = parse_fdf(fdf)["io"]
     assert io == {
         "system_label": "water", "use_save_xv": True, "use_save_dm": True, "dm_init_file": "water.DM",
-        "cdf_save": True, "save_hs": False,
+        "cdf_save": True, "save_hs": False, "must_converge": True,
     }
 
 

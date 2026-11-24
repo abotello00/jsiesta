@@ -61,6 +61,7 @@ THEORY_MAP: dict[str, tuple[str, ...]] = {
     "jax_siesta.observables": ("theory.variational_forces_and_stress",),
     "jax_siesta.io": ("theory.units_and_geometry",),
     "jax_siesta.testing": ("theory.variational_forces_and_stress",),
+    "jax_siesta.app": ("theory.units_and_geometry", "theory.adaptive_scf_and_dm_out"),
     "cpp": ("theory.grid_poisson_xc_dispersion", "theory.two_center_matel"),
 }
 

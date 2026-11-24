@@ -22,6 +22,7 @@ SIESTA Mapping:
     Replaces ``post_scf_work.F``, ``compute_energies.F90``, ``dfscf.F``, and ``siesta_forces.F``.
 """
 
+from jax_siesta.observables.bands import band_energies
 from jax_siesta.observables.forces import StaticObservableEvaluator
 
-__all__ = ["StaticObservableEvaluator"]
+__all__ = ["StaticObservableEvaluator", "band_energies"]

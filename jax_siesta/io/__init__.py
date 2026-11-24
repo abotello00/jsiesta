@@ -20,7 +20,7 @@ SIESTA Mapping:
     ``m_ncdf_siesta`` for the restart files.
 """
 
-from jax_siesta.io.fdf import load_case_json, observables_to_validation_dict, parse_fdf
+from jax_siesta.io.fdf import load_case_json, observables_to_validation_dict, parse_fdf, tokenize_fdf
 from jax_siesta.io.siesta_files import (
     MappingInfo,
     SiestaNCData,
@@ -73,6 +73,7 @@ __all__ = [
     "siesta_supercell_offsets",
     "structure_from_nc",
     "structure_from_xv",
+    "tokenize_fdf",
     "write_dm",
     "write_dm_file",
     "write_restart_files",

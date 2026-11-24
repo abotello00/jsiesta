@@ -1,0 +1,45 @@
+# Bulk silicon (diamond structure), PBE, double-zeta polarised basis.
+# Run:  jsiesta si.fdf --pseudo-dir ../pseudos > si.out
+
+SystemName   Bulk silicon
+SystemLabel  si
+
+NumberOfAtoms    2
+NumberOfSpecies  1
+%block ChemicalSpeciesLabel
+  1  14  Si
+%endblock ChemicalSpeciesLabel
+
+LatticeConstant  5.47 Ang
+%block LatticeVectors
+  0.0  0.5  0.5
+  0.5  0.0  0.5
+  0.5  0.5  0.0
+%endblock LatticeVectors
+
+AtomicCoordinatesFormat  Fractional
+%block AtomicCoordinatesAndAtomicSpecies
+  0.00  0.00  0.00  1
+  0.25  0.25  0.25  1
+%endblock AtomicCoordinatesAndAtomicSpecies
+
+PAO.BasisSize    DZP
+PAO.EnergyShift  0.02 Ry
+
+XC.Functional  GGA
+XC.Authors     PBE
+
+MeshCutoff  150 Ry
+%block kgrid.MonkhorstPack
+  4  0  0  0.0
+  0  4  0  0.0
+  0  0  4  0.0
+%endblock kgrid.MonkhorstPack
+
+# Band structure along L - Gamma - X (written to si.bands)
+BandLinesScale  ReciprocalLatticeVectors
+%block BandLines
+   1  0.5  0.5  0.5  L
+  30  0.0  0.0  0.0  \Gamma
+  30  0.5  0.0  0.5  X
+%endblock BandLines
