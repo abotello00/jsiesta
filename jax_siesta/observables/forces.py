@@ -43,7 +43,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_siesta.core.protocols import SymmetryProjector
+from jax_siesta.core.protocols import SymmetryProjector, bind_symmetry, symmetry_jit_arrays
 from jax_siesta.core.types import (
     BasisData,
     KPointMesh,
@@ -107,9 +107,10 @@ def _fresh_grid_energies(
     nspin: int,
     xc_functional: str,
     sym: _StaticByIdentity | None,
+    sym_arrays: Any = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fresh grid pass from ``DM_out``: ``(rho_tot, rho_core, sum rho dV, E_H, E_xc, E_V_NA,grid)``."""
-    sym_proj = sym.obj if sym is not None else None
+    sym_proj = bind_symmetry(sym.obj if sym is not None else None, sym_arrays, nspin)
     xc_eval = LibxcFFIEvaluator(xc_functional)
     rho = rhoofd_differentiable(dm_real, positions, cell, packed, mesh_shape, nspin)
     rho_na, v_na, rho_core = neutral_atom_grid_differentiable(positions, cell, na_packed, mesh_shape)
@@ -207,9 +208,10 @@ def _grid_energy_and_pullback(
     xc_functional: str,
     use_rvv10: bool,
     sym: _StaticByIdentity | None,
+    sym_arrays: Any = None,
 ) -> tuple[jax.Array, Any]:
     """Forward pass of the fixed-DM grid energy and its pullback (a ``jax.tree_util.Partial``) for the backward pass."""
-    sym_proj = sym.obj if sym is not None else None
+    sym_proj = bind_symmetry(sym.obj if sym is not None else None, sym_arrays, nspin)
 
     def _energy(disp: jax.Array, eps: jax.Array) -> jax.Array:
         t_vna, t_h, t_xc, t_rvv = _deformed_grid_terms(
@@ -492,6 +494,7 @@ class StaticObservableEvaluator:
 
         # 1. Mandatory fresh non-mixed post-SCF evaluation from DM_out
         sym_static = _StaticByIdentity(sym_proj) if sym_proj is not None else None
+        sym_arrays = symmetry_jit_arrays(sym_proj, config.nspin)
         mesh_static = (int(mesh_shape[0]), int(mesh_shape[1]), int(mesh_shape[2]))
         rho_tot, rho_core, q_grid_arr, e_hartree, e_xc, e_v_na_grid = _fresh_grid_energies(
             dm_real,
@@ -504,6 +507,7 @@ class StaticObservableEvaluator:
             nspin=config.nspin,
             xc_functional=config.xc_functional,
             sym=sym_static,
+            sym_arrays=sym_arrays,
         )
         q_grid = float(q_grid_arr)
         n_electrons = basis.total_valence_electrons - config.net_charge
@@ -579,6 +583,7 @@ class StaticObservableEvaluator:
                 xc_functional=config.xc_functional,
                 use_rvv10=rvv10 is not None,
                 sym=sym_static,
+                sym_arrays=sym_arrays,
             )
             t_mark = _stage(timings_out, "grid_forward", t_mark, e_grid)
             g_grid_pos, g_grid_eps = _apply_pullback(grid_pullback, jnp.ones_like(e_grid))

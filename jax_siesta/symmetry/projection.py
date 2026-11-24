@@ -442,20 +442,25 @@ def build_symmetry_closed_pattern(
 
 @dataclass(frozen=True)
 class ProjectionTable:
-    r"""Precompiled sparse table executing :math:`\mathcal{P}_{\text{sym}}` as one gather and row sum.
+    r"""Precompiled sparse table executing :math:`\mathcal{P}_{\text{sym}}` as gathers and row sums.
 
     Theory:
         Row ``d`` of the projection (one flattened spin-edge index) is
         :math:`\sum_j w_{dj}\, x_{s_{dj}}` over the aggregated source entries of that row.
 
     Algorithm:
-        Built once per geometry and ``nspin`` mode by ``compile_projection_table``. The rows are stored padded to the
-        longest row (ELL layout: ``src_idx`` and ``weights`` of shape ``(n_segments, row_width)``, padding with
-        weight 0), so applying the table is a gather and a sum along rows, with no scatter: about 20x faster than
-        ``segment_sum`` on the CPU for a 48-operation group, at under 25 % padding.
+        Built once per geometry and ``nspin`` mode by ``compile_projection_table``. The rows are sorted by their
+        number of entries and stored in a few buckets of rows of similar length, each padded to its own longest
+        row with weight 0 (``src_idx[b]`` and ``weights[b]`` of shape ``(n_rows_b, width_b)``). Applying the table
+        is one gather and one sum along rows per bucket, then a gather with ``row_pos`` that puts the rows back in
+        their order; there is no scatter. When all rows have about the same length there is a single bucket (the
+        plain row-padded layout, about 20x faster than ``segment_sum`` on the CPU for a 48-operation group). When
+        they do not (spin-orbit coupling with a cubic group: 73 % padding in one bucket) the buckets keep the stored
+        entries within about 15 % of the non-zero ones.
 
     Invariants:
-        - ``src_idx.shape == weights.shape == (n_segments, row_width)``.
+        - ``row_pos.shape == (n_segments,)``; ``src_idx[b].shape == weights[b].shape``.
+        - Rows without entries are not stored: ``row_pos`` sends them to the zero tail.
         - Zero missing partners on any symmetry-closed ``SparsePattern``.
 
     SIESTA Mapping:
@@ -465,56 +470,191 @@ class ProjectionTable:
     nspin: int
     n_edges: int
     n_segments: int
-    src_idx: jax.Array
-    weights: jax.Array
+    row_pos: jax.Array
+    src_idx: tuple[jax.Array, ...]
+    weights: tuple[jax.Array, ...]
+
+    @property
+    def n_stored(self) -> int:
+        """Number of stored entries, padding included."""
+        return int(sum(int(w.size) for w in self.weights))
+
+    def arrays(self) -> tuple[jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+        """The arrays of the table as a pytree, to pass to a compiled function as an argument.
+
+        Theory:
+            The table is the sparse matrix of the projection; its arrays are data, not program.
+
+        Algorithm:
+            Returns the stored arrays without copying.
+
+        Returns:
+            Tuple ``(row_pos, src_idx, weights)``.
+
+        Invariants:
+            ``self.with_arrays(self.arrays())`` equals ``self``.
+
+        SIESTA Mapping:
+            None.
+        """
+        return (self.row_pos, self.src_idx, self.weights)
+
+    def with_arrays(self, arrays: tuple[jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]) -> "ProjectionTable":
+        """The same table on other (for example traced) copies of its arrays.
+
+        Theory:
+            Same projection; only the storage of the arrays differs.
+
+        Algorithm:
+            Builds a new frozen table with the scalar fields of this one.
+
+        Parameters:
+            arrays: Tuple ``(row_pos, src_idx, weights)`` as returned by ``arrays``.
+
+        Returns:
+            ``ProjectionTable`` with ``nspin``, ``n_edges`` and ``n_segments`` of this table.
+
+        Invariants:
+            Applies exactly as this table when the arrays hold the same values.
+
+        SIESTA Mapping:
+            None.
+        """
+        row_pos, src_idx, weights = arrays
+        return ProjectionTable(self.nspin, self.n_edges, self.n_segments, row_pos, tuple(src_idx), tuple(weights))
 
 
-def _aggregate_ell(
-    dst_list: list[np.ndarray],
-    src_list: list[np.ndarray],
-    w_list: list[np.ndarray],
-    n_segments: int,
-    tol: float = 1e-13,
-) -> tuple[jax.Array, jax.Array]:
-    """Sum duplicate ``(dst, src)`` entries, drop sub-tolerance weights, and pad the rows (``ProjectionTable``)."""
-    dst = np.concatenate(dst_list).astype(np.int64)
-    src = np.concatenate(src_list).astype(np.int64)
-    w = np.concatenate(w_list).astype(np.float64)
+def _bucket_bounds(lengths_desc: np.ndarray, max_buckets: int, max_padding: float) -> list[int]:
+    """Split rows sorted by decreasing length into at most ``max_buckets`` contiguous buckets.
 
-    mask = np.abs(w) > tol
-    dst = dst[mask]
-    src = src[mask]
-    w = w[mask]
-    if dst.size == 0:
-        return jnp.zeros((n_segments, 1), dtype=jnp.int32), jnp.zeros((n_segments, 1), dtype=jnp.float64)
+    Returns the start position of each bucket. The split minimises the stored entries (every row padded to the
+    longest row of its bucket) by dynamic programming over the distinct lengths, with the fewest buckets that keep
+    the padding below ``max_padding`` times the non-zero entries (or ``max_buckets`` when none does).
+    """
+    vals, first, counts = np.unique(-lengths_desc, return_index=True, return_counts=True)
+    vals = -vals  # distinct lengths, decreasing; first[i] is the position of the first row of length vals[i]
+    n_d = int(vals.size)
+    cum = np.concatenate([[0], np.cumsum(counts)]).astype(np.float64)
+    nnz = float(np.sum(vals * counts))
+    # best[k][j]: minimal stored entries for the first j distinct lengths in k buckets; a bucket i..j-1 costs
+    # vals[i] * (number of rows in it)
+    inf = np.inf
+    best = np.full((max_buckets + 1, n_d + 1), inf)
+    back = np.zeros((max_buckets + 1, n_d + 1), dtype=np.int64)
+    best[0, 0] = 0.0
+    k_used = max_buckets
+    for k in range(1, max_buckets + 1):
+        for j in range(k, n_d + 1):
+            cand = best[k - 1, :j] + vals[:j] * (cum[j] - cum[:j])
+            i = int(np.argmin(cand))
+            best[k, j] = cand[i]
+            back[k, j] = i
+        if best[k, n_d] <= (1.0 + max_padding) * nnz or k == n_d:
+            k_used = k
+            break
+    k_used = min(k_used, n_d)
+    cuts: list[int] = []
+    j = n_d
+    for k in range(k_used, 0, -1):
+        i = int(back[k, j])
+        cuts.append(int(first[i]))
+        j = i
+    return cuts[::-1]
 
-    keys = dst * np.int64(n_segments) + src
-    order = np.argsort(keys)
-    keys_s = keys[order]
-    dst_s = dst[order]
-    src_s = src[order]
-    w_s = w[order]
 
-    uniq_mask = np.empty(keys_s.shape[0], dtype=bool)
-    uniq_mask[0] = True
-    uniq_mask[1:] = keys_s[1:] != keys_s[:-1]
-    starts = np.where(uniq_mask)[0]
-    w_agg = np.add.reduceat(w_s, starts)
-    keep = np.abs(w_agg) > tol
+class _CooAccumulator:
+    """Running sum of duplicate ``(dst, src)`` weights, kept compact so the set-up memory stays bounded.
 
-    src_c = src_s[starts][keep]
-    dst_c = dst_s[starts][keep]
-    w_c = w_agg[keep]
-    # entries are sorted by (dst, src): the position of an entry within its row is its offset from the row start
-    row_len = np.bincount(dst_c, minlength=n_segments)
-    width = max(1, int(row_len.max()))
-    row_start = np.concatenate([[0], np.cumsum(row_len)[:-1]])
-    col = np.arange(dst_c.size) - row_start[dst_c]
-    src_ell = np.zeros((n_segments, width), dtype=np.int32)
-    w_ell = np.zeros((n_segments, width), dtype=np.float64)
-    src_ell[dst_c, col] = src_c
-    w_ell[dst_c, col] = w_c
-    return jnp.asarray(src_ell), jnp.asarray(w_ell)
+    The entries of a projection table are generated operation by operation; a cubic group with spin-orbit coupling
+    generates far more entries than the table finally holds, because most of them fall on the same ``(dst, src)``
+    pair. Appended entries are buffered and merged (sorted by key, duplicates summed) whenever the buffer exceeds
+    ``flush_at`` entries, so the peak memory is set by the size of the final table, not by the number generated.
+    """
+
+    def __init__(self, n_segments: int, flush_at: int = 2_000_000, tol: float = 1e-13) -> None:
+        self.n_segments = int(n_segments)
+        self.flush_at = int(flush_at)
+        self.tol = float(tol)
+        self._keys: list[np.ndarray] = []
+        self._w: list[np.ndarray] = []
+        self._pending = 0
+        self._has_merged = False
+
+    def add(self, dst: np.ndarray, src: np.ndarray, w: np.ndarray) -> None:
+        """Append entries ``w`` at ``(dst, src)``; single entries below the tolerance are dropped."""
+        w = np.asarray(w, dtype=np.float64)
+        mask = np.abs(w) > self.tol
+        if not np.any(mask):
+            return
+        keys = np.asarray(dst, dtype=np.int64)[mask] * np.int64(self.n_segments) + np.asarray(src, dtype=np.int64)[mask]
+        self._keys.append(keys)
+        self._w.append(w[mask])
+        self._pending += int(keys.size)
+        # merge when the new entries outweigh the merged ones: the total sorting work stays O(n log n)
+        merged = int(self._keys[0].size) if self._has_merged else 0
+        if self._pending > max(self.flush_at, merged):
+            self._merge()
+
+    def _merge(self) -> None:
+        if not self._keys:
+            return
+        keys = np.concatenate(self._keys)
+        w = np.concatenate(self._w)
+        order = np.argsort(keys, kind="stable")
+        keys = keys[order]
+        w = w[order]
+        first = np.empty(keys.shape[0], dtype=bool)
+        first[0] = True
+        first[1:] = keys[1:] != keys[:-1]
+        starts = np.nonzero(first)[0]
+        self._keys = [keys[starts]]
+        self._w = [np.add.reduceat(w, starts)]
+        # the merged entries are not counted as pending: only new entries trigger the next merge
+        self._pending = 0
+        self._has_merged = True
+
+    def to_buckets(
+        self, max_buckets: int = 8, max_padding: float = 0.15
+    ) -> tuple[jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+        """Summed weights as ``(row_pos, src_idx, weights)`` in row-length buckets (see ``ProjectionTable``)."""
+        n_segments = self.n_segments
+        self._merge()
+        keys = np.zeros((0,), dtype=np.int64)
+        w_c = np.zeros((0,), dtype=np.float64)
+        if self._keys:
+            keep = np.abs(self._w[0]) > self.tol
+            keys = self._keys[0][keep]
+            w_c = self._w[0][keep]
+        if keys.size == 0:
+            # no entries: every row is in the zero tail
+            return jnp.zeros((n_segments,), dtype=jnp.int32), (), ()
+        dst_c = keys // n_segments
+        src_c = keys % n_segments
+        # entries are sorted by (dst, src): the position of an entry within its row is its offset from the row start
+        row_len = np.bincount(dst_c, minlength=n_segments)
+        row_start = np.concatenate([[0], np.cumsum(row_len)[:-1]])
+        col = np.arange(dst_c.size) - row_start[dst_c]
+
+        order = np.argsort(-row_len, kind="stable")  # rows by decreasing length; empty rows last
+        row_pos = np.empty(n_segments, dtype=np.int64)
+        row_pos[order] = np.arange(n_segments)
+        n_rows = int(np.count_nonzero(row_len))
+        len_sorted = row_len[order][:n_rows]
+        starts = _bucket_bounds(len_sorted, max_buckets, max_padding)
+        ends = starts[1:] + [n_rows]
+        ent_pos = row_pos[dst_c]
+        src_b: list[jax.Array] = []
+        w_b: list[jax.Array] = []
+        for lo, hi in zip(starts, ends):
+            width = int(len_sorted[lo])
+            sel = (ent_pos >= lo) & (ent_pos < hi)
+            src_ell = np.zeros((hi - lo, width), dtype=np.int32)
+            w_ell = np.zeros((hi - lo, width), dtype=np.float64)
+            src_ell[ent_pos[sel] - lo, col[sel]] = src_c[sel]
+            w_ell[ent_pos[sel] - lo, col[sel]] = w_c[sel]
+            src_b.append(jnp.asarray(src_ell))
+            w_b.append(jnp.asarray(w_ell))
+        return jnp.asarray(row_pos.astype(np.int32)), tuple(src_b), tuple(w_b)
 
 
 def compile_projection_table(
@@ -567,8 +707,9 @@ def compile_projection_table(
             nspin=nspin,
             n_edges=n_edges,
             n_segments=n_seg,
-            src_idx=jnp.arange(n_seg, dtype=jnp.int32)[:, None],
-            weights=jnp.ones((n_seg, 1), dtype=jnp.float64),
+            row_pos=jnp.arange(n_seg, dtype=jnp.int32),
+            src_idx=(jnp.arange(n_seg, dtype=jnp.int32)[:, None],),
+            weights=(jnp.ones((n_seg, 1), dtype=jnp.float64),),
         )
 
     _, sh_atom, sh_l, sh_mu0, orb_to_sh, sh_map = _shell_arrays(basis, sg)
@@ -651,9 +792,9 @@ def compile_projection_table(
                         rules_s.append((ch_i, si, si_t, tr_val * wi))
             spin_rules.append(rules_s)
 
-    dst_acc: list[np.ndarray] = []
-    src_acc: list[np.ndarray] = []
-    w_acc: list[np.ndarray] = []
+    n_ch = 1 if nspin == 1 else (2 if nspin == 2 else 6)
+    n_seg = n_ch * n_edges
+    acc = _CooAccumulator(n_seg)
     time_rev = np.asarray(sg.time_reversals, dtype=bool)
 
     for l1 in np.unique(b_l1):
@@ -698,31 +839,24 @@ def compile_projection_table(
                 w_vals = np.broadcast_to(w_mat[ii, jj], (cls.size, ii.size)).ravel()
 
                 if nspin == 1:
-                    dst_acc.append(d_edges)
-                    src_acc.append(s_edges)
-                    w_acc.append(w_vals)
+                    acc.add(d_edges, s_edges, w_vals)
                 elif nspin == 2:
                     for ch_s in (0, 1):
                         ch_d = (1 - ch_s) if time_rev[s] else ch_s
-                        dst_acc.append(ch_d * n_edges + d_edges)
-                        src_acc.append(ch_s * n_edges + s_edges)
-                        w_acc.append(w_vals)
+                        acc.add(ch_d * n_edges + d_edges, ch_s * n_edges + s_edges, w_vals)
                 else:
                     s_edges_t = src_cls_t[:, jj].ravel()
                     for ch_d, ch_s, use_t, sp_w in spin_rules[s]:
-                        dst_acc.append(ch_d * n_edges + d_edges)
-                        src_acc.append(ch_s * n_edges + (s_edges_t if use_t else s_edges))
-                        w_acc.append(sp_w * w_vals)
+                        acc.add(ch_d * n_edges + d_edges, ch_s * n_edges + (s_edges_t if use_t else s_edges), sp_w * w_vals)
 
-    n_ch = 1 if nspin == 1 else (2 if nspin == 2 else 6)
-    n_seg = n_ch * n_edges
-    src_ell, w_ell = _aggregate_ell(dst_acc, src_acc, w_acc, n_segments=n_seg)
+    row_pos, src_b, w_b = acc.to_buckets()
     return ProjectionTable(
         nspin=nspin,
         n_edges=n_edges,
         n_segments=n_seg,
-        src_idx=src_ell,
-        weights=w_ell,
+        row_pos=row_pos,
+        src_idx=src_b,
+        weights=w_b,
     )
 
 
@@ -737,7 +871,7 @@ def apply_projection_table(
         real channels (or 6 real subchannels encoding complex ``[uu, dd, Re(ud), Im(ud)]``).
 
     Algorithm:
-        Pure JAX vectorized gather-multiply-row sum without Python loops, compiled once per
+        Pure JAX vectorized gather-multiply-row sum per row-length bucket, compiled once per
         shape (calls outside ``jax.jit`` would otherwise dispatch each operation separately).
 
     Parameters:
@@ -754,22 +888,34 @@ def apply_projection_table(
     SIESTA Mapping:
         Replaces runtime projection loop in ``m_dm_symmetrize.F90``.
     """
-    return _apply_projection(matrix_edges, table.src_idx, table.weights, nspin=table.nspin, n_edges=table.n_edges)
+    return _apply_projection(
+        matrix_edges, table.row_pos, table.src_idx, table.weights, nspin=table.nspin, n_edges=table.n_edges
+    )
 
 
 @partial(jax.jit, static_argnames=("nspin", "n_edges"))
 def _apply_projection(
     matrix_edges: jax.Array,
-    src_idx: jax.Array,
-    weights: jax.Array,
+    row_pos: jax.Array,
+    src_idx: tuple[jax.Array, ...],
+    weights: tuple[jax.Array, ...],
     *,
     nspin: int,
     n_edges: int,
 ) -> jax.Array:
     """Compiled body of :func:`apply_projection_table` (one compilation per shape, also when called eagerly)."""
+
+    def _rows(flat: jax.Array) -> jax.Array:
+        # one gather and row sum per bucket, in sorted-row order; rows without entries are the zero tail
+        parts = [jnp.sum(flat[s_b] * w_b, axis=1) for s_b, w_b in zip(src_idx, weights)]
+        n_stored = sum(int(s_b.shape[0]) for s_b in src_idx)
+        if n_stored < row_pos.shape[0]:
+            parts.append(jnp.zeros((row_pos.shape[0] - n_stored,), dtype=jnp.float64))
+        return jnp.concatenate(parts)[row_pos]
+
     if nspin in (1, 2):
         flat_in = jnp.real(matrix_edges).reshape(-1)
-        out = jnp.sum(flat_in[src_idx] * weights, axis=1)
+        out = _rows(flat_in)
         res = out.reshape((nspin, n_edges))
         return res.astype(matrix_edges.dtype)
 
@@ -789,7 +935,7 @@ def _apply_projection(
         ],
         axis=0,
     )
-    out6 = jnp.sum(flat6[src_idx] * weights, axis=1).reshape((6, n_edges))
+    out6 = _rows(flat6).reshape((6, n_edges))
 
     if is_cplx:
         return jnp.stack(

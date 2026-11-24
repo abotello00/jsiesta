@@ -8,11 +8,13 @@ declare them with ``@pytest.mark.external_refs("key", ...)``; keys are resolved 
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import os
 import platform
 from pathlib import Path
 import subprocess
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 
 import pytest
 
@@ -44,6 +46,41 @@ def _record_run_identity(record_testsuite_property: Callable[[str, object], None
     record_testsuite_property(
         "platform", os.environ.get("JSIESTA_PLATFORM") or f"{platform.system().lower()}-{platform.machine()}"
     )
+
+
+# Resident memory above which the compiled-function caches are dropped after a test (MiB).
+_RSS_CLEAR_MIB = float(os.environ.get("JSIESTA_TEST_RSS_CLEAR_MIB", "1500"))
+
+
+def _rss_mib() -> float:
+    try:
+        with open("/proc/self/status", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
+
+@pytest.fixture(autouse=True)
+def _bound_process_memory() -> Iterator[None]:
+    """Drop JAX's compiled-function caches after a test once the process has grown past ``_RSS_CLEAR_MIB``.
+
+    Every compiled SCF function keeps its executable and the arrays baked into it (grids, symmetry tables) alive
+    for the life of the process, so a single-process run of the whole suite otherwise grows by several hundred MiB
+    per SCF test and ends in the out-of-memory killer. Small tests stay below the threshold and keep their caches.
+    """
+    yield
+    if _rss_mib() > _RSS_CLEAR_MIB:
+        import jax
+
+        jax.clear_caches()
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
 
 
 @pytest.fixture

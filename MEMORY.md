@@ -4,7 +4,7 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-24 (D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files)
+- **Last updated:** 2026-11-24 (D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files, D-052 projection table and test memory)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.

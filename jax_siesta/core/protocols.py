@@ -345,3 +345,62 @@ class ObservableEvaluator(Protocol):
     ) -> Observables:
         """Run clean post-SCF ``DM_out`` pass and compute variational forces and stress."""
         ...
+
+
+def symmetry_jit_arrays(sym_proj: Any, nspin: int) -> Any:
+    """Large arrays of a symmetry projector, to pass to a compiled function as an argument.
+
+    Theory:
+        The projection of a sparse matrix and the symmetrisation of a grid field are linear maps given by lookup
+        tables (projection table, grid permutations) that are fixed for a geometry.
+
+    Algorithm:
+        Returns ``sym_proj.jit_arrays(nspin)`` when the projector provides it. A compiled function that reads the
+        tables from a projector it takes as a static argument bakes a private copy of them into its executable;
+        as an argument there is a single copy.
+
+    Parameters:
+        sym_proj: Symmetry projector or ``None``.
+        nspin: Spin mode ``1, 2, 4, 8`` of the matrices to project.
+
+    Returns:
+        Pytree of arrays, or ``None`` without a projector or when it has no such arrays.
+
+    Invariants:
+        ``bind_symmetry(sym_proj, symmetry_jit_arrays(sym_proj, nspin), nspin)`` acts exactly as ``sym_proj``.
+
+    SIESTA Mapping:
+        None (set-up of compiled code); the tables replace ``m_dm_symmetrize.F90``.
+    """
+    if sym_proj is None or not hasattr(sym_proj, "jit_arrays"):
+        return None
+    return sym_proj.jit_arrays(nspin)
+
+
+def bind_symmetry(sym_proj: Any, sym_arrays: Any, nspin: int) -> Any:
+    """The projector to use inside a compiled function, reading its large arrays from ``sym_arrays``.
+
+    Theory:
+        Same linear maps as ``sym_proj``; only the storage of the lookup tables differs (traced arguments instead of
+        constants of the compiled function).
+
+    Algorithm:
+        Returns ``sym_proj.bound(sym_arrays, nspin)``, or ``sym_proj`` itself when there is nothing to bind.
+
+    Parameters:
+        sym_proj: Symmetry projector or ``None``.
+        sym_arrays: Result of ``symmetry_jit_arrays`` (possibly traced), or ``None``.
+        nspin: Spin mode ``1, 2, 4, 8`` the arrays were taken for.
+
+    Returns:
+        Projector with the same methods as ``sym_proj``, or ``None``.
+
+    Invariants:
+        Results are identical to those of ``sym_proj``.
+
+    SIESTA Mapping:
+        None (set-up of compiled code).
+    """
+    if sym_proj is None or sym_arrays is None:
+        return sym_proj
+    return sym_proj.bound(sym_arrays, nspin)

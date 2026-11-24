@@ -179,19 +179,15 @@ def test_mgga_xc_functional_derivative_stress_and_spin_rotation(func: str) -> No
 
 
 @pytest.mark.skipif(not _has_libxc(), reason="External Libxc meta-GGA support unavailable.")
-@pytest.mark.parametrize(
-    ("case_name", "prefer_lj"),
-    [
-        ("si_bulk", False),
-        ("co_hcp_collinear", False),
-        ("co_hcp_nc", False),
-        ("co_hcp_soc", True),
-    ],
-)
-def test_mgga_ibz_symmetry_vs_full_bz(case_name: str, prefer_lj: bool) -> None:
-    """Verify ``R2SCAN01`` native ``spglib`` IBZ symmetry matches full-BZ SCF across all spin modes."""
-    s, basis, pat, cfg, k_grid = _load_fixture(case_name, prefer_lj=prefer_lj)
-    k_use = (2, 2, 2) if case_name == "si_bulk" else k_grid
+def test_mgga_ibz_symmetry_vs_full_bz() -> None:
+    """Verify ``R2SCAN01`` native ``spglib`` IBZ symmetry matches the full-BZ SCF on bulk Si.
+
+    The agreement of the symmetrised and the full-BZ run across the spin modes is the subject of
+    ``test_ibz_symmetrized_vs_full_bz_unsymmetrized_parity``; what a meta-GGA adds is the symmetrisation of the
+    kinetic-energy density and of its potential, which does not depend on the spin mode, so one case covers it.
+    """
+    s, basis, pat, cfg, _ = _load_fixture("si_bulk")
+    k_use = (2, 2, 2)
     cfg_full = replace(cfg, xc_functional="R2SCAN01", use_symmetry=False, mesh_cutoff_ry=100.0)
     kmesh_full = build_monkhorst_pack_mesh(k_use)
     ms = choose_mesh_dimensions(s.cell, cfg_full.mesh_cutoff_ry)

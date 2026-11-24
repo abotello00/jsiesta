@@ -33,7 +33,8 @@ SIESTA Mapping:
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -151,15 +152,69 @@ class NativeSymmetryEngine:
         """
         if self.sg.n_ops == 1:
             return matrix_edges
+        return apply_projection_table(matrix_edges, self._table_for(nspin))
+
+    def _table_for(self, nspin: int) -> ProjectionTable:
+        """Projection table of spin mode ``nspin`` (built on first use for modes other than the engine's own)."""
         if nspin == self.proj_table.nspin:
-            table = self.proj_table
-        else:
-            cached = self._extra_tables.get(nspin)
-            if cached is None:
-                cached = compile_projection_table(self.basis, self.pattern, self.sg, self.wigner_d, nspin)
-                self._extra_tables[nspin] = cached
-            table = cached
-        return apply_projection_table(matrix_edges, table)
+            return self.proj_table
+        cached = self._extra_tables.get(nspin)
+        if cached is None:
+            cached = compile_projection_table(self.basis, self.pattern, self.sg, self.wigner_d, nspin)
+            self._extra_tables[nspin] = cached
+        return cached
+
+    def jit_arrays(self, nspin: int) -> dict[str, Any]:
+        """The large lookup arrays, to pass to a compiled function as an argument (see ``bound``).
+
+        Theory:
+            The projection table and the grid permutations define the linear maps of ``project_matrix`` and
+            ``symmetrize_grid``; they are fixed for a geometry.
+
+        Algorithm:
+            A compiled function that takes the engine as a static argument and uses its arrays directly gets them
+            baked in as constants: one private copy of the projection table and of the grid permutations per compiled
+            function. Passing them as arguments keeps a single copy.
+
+        Parameters:
+            nspin: Spin mode ``1, 2, 4, 8`` of the matrices to project.
+
+        Returns:
+            Dict with ``perm_inv`` (``(n_ops, n_grid)``) and ``proj`` (``ProjectionTable.arrays()``).
+
+        Invariants:
+            ``self.bound(self.jit_arrays(nspin), nspin)`` acts exactly as ``self``.
+
+        SIESTA Mapping:
+            None (set-up of compiled code).
+        """
+        return {"perm_inv": self._perm_inv_jax, "proj": self._table_for(nspin).arrays()}
+
+    def bound(self, arrays: dict[str, Any], nspin: int) -> "NativeSymmetryEngine":
+        """A view of this engine that reads its large arrays from ``arrays`` (the traced ``jit_arrays``).
+
+        Theory:
+            Same symmetry operations and the same linear maps as this engine.
+
+        Algorithm:
+            Shallow copy with the grid permutations and the projection table of spin mode ``nspin`` replaced.
+
+        Parameters:
+            arrays: Result of ``jit_arrays(nspin)``, possibly traced.
+            nspin: Spin mode the arrays were taken for.
+
+        Returns:
+            ``NativeSymmetryEngine`` sharing every other field with this one.
+
+        Invariants:
+            ``project_matrix(., nspin)`` and ``symmetrize_grid`` give the results of this engine.
+
+        SIESTA Mapping:
+            None (set-up of compiled code).
+        """
+        return replace(
+            self, _perm_inv_jax=arrays["perm_inv"], proj_table=self._table_for(nspin).with_arrays(arrays["proj"])
+        )
 
     def symmetrize_grid(self, grid_field: jax.Array) -> jax.Array:
         r"""Apply exact group averaging over commensurate 3D real-space permutations :math:`\pi_S`.

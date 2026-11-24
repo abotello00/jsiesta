@@ -1079,3 +1079,29 @@
 - **Not written:** velocities (zero), the `GRID` group and the radial tables of the `BASIS` group of the `.nc` file,
   `.HSX`, `.TSHS` and `DMHS.nc`.
 
+## D-052: Projection table in row-length buckets, passed to compiled code as an argument; test memory bounded (2026-11-24)
+
+- **Why:** on a 15 GB laptop the test suite was killed by the out-of-memory daemon. FCC Co with spin-orbit coupling
+  (1 atom, 48 operations, `test_nspin8_offdiagonal_su2_hamiltonian_and_dm_mixing`) needed more than 8 GB: (i) the
+  projection-table set-up of D-050 held every generated `(dst, src, weight)` entry before summing duplicates; (ii) the
+  row-padded table of D-049 was 215136 x 528 with 73 % padding (1.3 GB), because with spin-orbit coupling and a cubic
+  group the row lengths differ by a factor of six; (iii) the compiled SCF and force functions take the symmetry engine
+  as a static argument and read its arrays directly, so each of them baked in a private copy of the table and of the
+  grid permutations. Independently, a single-process run of the suite grew by several hundred MiB per SCF test,
+  because JAX keeps every compiled function and its constants.
+- **Decision:** (i) `_CooAccumulator` sums duplicates while the entries are generated. (ii) `ProjectionTable` stores
+  the rows sorted by length in at most 8 buckets of similar length (dynamic programming over the distinct lengths,
+  fewest buckets with at most 15 % padding); applying it is one gather and row sum per bucket and a final gather
+  `row_pos`, still without a scatter. Uniform tables keep a single bucket. (iii) `NativeSymmetryEngine.jit_arrays`
+  and `bound`, with `symmetry_jit_arrays` and `bind_symmetry` in `core/protocols.py`: the five compiled functions
+  receive the table and the grid permutations as the argument `sym_arrays`. (iv) `tests/conftest.py` drops JAX's
+  caches after a test once the process is above 1.5 GB (`JSIESTA_TEST_RSS_CLEAR_MIB`).
+  `test_mgga_ibz_symmetry_vs_full_bz` keeps the Si case only: the agreement across spin modes is the subject of
+  `test_ibz_symmetrized_vs_full_bz_unsymmetrized_parity`, and the meta-GGA part (symmetrising tau) does not depend on
+  the spin mode.
+- **Effect (laptop CPU):** projection, single bucket -> buckets, same result to 2e-16: Si bulk (48 operations)
+  1.17 -> 0.87 ms; Co hcp collinear 1.22 -> 1.11 ms; Co hcp spin-orbit 3.04 -> 2.84 ms; FCC Co spin-orbit
+  190 -> 54 ms with 113.6 M -> 34.6 M stored entries. FCC Co spin-orbit: resident memory after the set-up
+  1.6 -> 0.8 GB, SCF from more than 5 GB (killed) to about 1 GB. The R2SCAN test: 236 s -> about 9 s.
+- **Not measured:** the GPU, compilation time and end-to-end SCF time.
+

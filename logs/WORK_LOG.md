@@ -318,3 +318,16 @@
   Sphinx `-W` pass.
 - Next: run `tests/test_siesta_files.py` where `siesta_bin` and `pseudodojo_sr_pbe_dir` are configured.
 
+### 2026-11-24 — Test memory and the symmetry projection table (D-052) (Claude Code)
+- Merged `perf/fixed-costs`, `perf/basis-opt` and `feature/siesta-restart-io` into `main` (warm start ported onto the
+  compiled cold-start path; restart-file decision renumbered D-051; KG builder skips `typing.overload` stubs).
+- Profiled every test (wall time, peak and residual memory, one capped systemd scope per file). The out-of-memory
+  kills came from the FCC Co spin-orbit test and from compiled functions accumulating over a single-process run.
+- Fixes of D-052: bucketed projection table, table and grid permutations passed to compiled code as arguments,
+  duplicate entries summed during the set-up, cache clearing in `tests/conftest.py`, R2SCAN symmetry test reduced
+  to Si.
+- Libxc 6.2.2 built from source into `~/.local/opt/libxc` on the laptop (`LIBXC_ROOT`). The 7.0.0 release does not
+  compile: `cpp/src/ffi_registry.cpp` calls `xc_hyb_type` for major version 7, which that release does not have.
+- Open: `test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage` ran for 19 hours without finishing
+  on the laptop before the merge and has not been run since.
+

@@ -41,3 +41,6 @@ tests/external_refs.local.toml
 docs/_generated/
 refs_cache
 refs_cache/
+
+# Local Claude Code configuration and project skills (machine- and user-specific)
+.claude/

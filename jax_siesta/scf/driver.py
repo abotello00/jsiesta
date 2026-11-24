@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_siesta.core.protocols import SymmetryProjector
+from jax_siesta.core.protocols import SymmetryProjector, bind_symmetry, symmetry_jit_arrays
 from jax_siesta.core.types import (
     BasisData,
     KPointMesh,
@@ -196,12 +196,13 @@ def _seed_grids_and_hamiltonian(
     with_tau_core: bool,
     n_edges: int,
     sym: _StaticByIdentity | None,
+    sym_arrays: Any = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
     """Neutral-atom grids, core densities and the seed Hamiltonian ``H0 + V[rho_NA]``, in one compiled call.
 
     Returns ``(h_seed, rho_na, v_na, rho_core, tau_core)``; ``tau_core`` is ``None`` unless ``with_tau_core``.
     """
-    sym_proj = sym.obj if sym is not None else None
+    sym_proj = bind_symmetry(sym.obj if sym is not None else None, sym_arrays, nspin)
     rho_na, v_na, rho_core = neutral_atom_grid_differentiable(positions, cell, na_packed, mesh_shape)
     tau_core = tau_core_grid_differentiable(positions, cell, na_packed, mesh_shape) if with_tau_core else None
     if sym_proj is not None:
@@ -266,7 +267,8 @@ class _StaticByIdentity:
 
 # The SCF's compiled functions live at module level and take everything that depends on the geometry as arguments,
 # so a new geometry with the same array shapes reuses the compiled code (and the persistent compilation cache can hit).
-# Only shapes, spin mode, functional, dispersion choice and the symmetry engine (by identity) are static.
+# Only shapes, spin mode, functional, dispersion choice and the symmetry engine (by identity) are static; the engine's
+# large arrays are passed as the argument ``sym_arrays`` so that they are not baked into every compiled function.
 
 
 @partial(jax.jit, static_argnames=("nspin", "real_k"))
@@ -328,12 +330,13 @@ def _grid_hamiltonian_and_energies(
     use_rvv10: bool,
     n_edges: int,
     sym: _StaticByIdentity | None,
+    sym_arrays: Any = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Grid Hamiltonian and grid energies of a density matrix: ``(h_grid, e_h, e_xc, e_disp, e_v_na, Tr[rho V_eff])``."""
     grid_ops = GridOps()
     xc_eval = LibxcFFIEvaluator(xc_functional)
     rvv10 = RVV10Dispersion() if use_rvv10 else None
-    sym_proj = sym.obj if sym is not None else None
+    sym_proj = bind_symmetry(sym.obj if sym is not None else None, sym_arrays, nspin)
     dm_real = jnp.real(dm_mat) if jnp.iscomplexobj(dm_mat) else dm_mat
     rho = rhoofd_differentiable(dm_real, positions, cell, packed_basis, mesh_shape, nspin)
     if sym_proj is not None:
@@ -401,6 +404,7 @@ def _iteration_update(
     *,
     nspin: int,
     sym: _StaticByIdentity | None,
+    sym_arrays: Any = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Bookkeeping of one SCF iteration: ``(h_out, free_e_scf, harris_e, d_max, h_max)``.
 
@@ -410,7 +414,7 @@ def _iteration_update(
     """
     h_out = h0 + h_grid_out.astype(h0.dtype)
     if sym is not None:
-        h_out = sym.obj.project_matrix(h_out, nspin)
+        h_out = bind_symmetry(sym.obj if sym is not None else None, sym_arrays, nspin).project_matrix(h_out, nspin)
     h_grid_in = h_cur - h0
     tr_in = _trace_dm_h(dm_out, h_grid_in, nspin)
     free_e_scf = e_band - tr_in + e_v_na + e_h + e_xc + e_disp + e_na_pair + entropy
@@ -517,6 +521,7 @@ def run_scf(
     n_edges = pattern.n_edges
     packed_basis = _pack_basis_grid_buffers(basis, pattern)
     sym_static = _StaticByIdentity(sym_proj) if sym_proj is not None else None
+    sym_arrays = symmetry_jit_arrays(sym_proj, config.nspin)
 
     # Neutral-atom grids and the cold-start seed H0 + V_xc[rho_NA] + V_NA (the grids are needed by warm starts too).
     h_init, rho_na, v_na, rho_core, tau_core = _seed_grids_and_hamiltonian(
@@ -531,6 +536,7 @@ def run_scf(
         with_tau_core=xc_eval.is_mgga,
         n_edges=n_edges,
         sym=sym_static,
+        sym_arrays=sym_arrays,
     )
     if initial_h is not None:
         initial_h = _as_restart_matrix(initial_h, pattern, config.nspin, "h")
@@ -581,6 +587,7 @@ def run_scf(
             use_rvv10=rvv10 is not None,
             n_edges=n_edges,
             sym=sym_static,
+            sym_arrays=sym_arrays,
         )
 
     h_grid_0, e_h_0, e_xc_0, e_disp_0, e_v_na_0, _ = _eval_h_grid_and_energy(dm_init)
@@ -652,6 +659,7 @@ def run_scf(
             two_center.e_na_pair,
             nspin=config.nspin,
             sym=sym_static,
+            sym_arrays=sym_arrays,
         )
         d_max = float(d_max_arr)
         h_max = float(h_max_arr)

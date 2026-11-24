@@ -397,8 +397,13 @@ def test_symmetry_setup_cache_reuses_the_engine_while_the_neighbour_set_is_uncha
     np.testing.assert_array_equal(np.asarray(pat_f.src_orb), np.asarray(pat_a.src_orb))
     np.testing.assert_array_equal(np.asarray(pat_f.edge_cell_idx), np.asarray(pat_a.edge_cell_idx))
     np.testing.assert_array_equal(np.asarray(km_f.kpoints_frac), np.asarray(km_a.kpoints_frac))
-    np.testing.assert_array_equal(np.asarray(eng_f.proj_table.src_idx), np.asarray(eng_a.proj_table.src_idx))
-    np.testing.assert_array_equal(np.asarray(eng_f.proj_table.weights), np.asarray(eng_a.proj_table.weights))
+    np.testing.assert_array_equal(np.asarray(eng_f.proj_table.row_pos), np.asarray(eng_a.proj_table.row_pos))
+    assert len(eng_f.proj_table.src_idx) == len(eng_a.proj_table.src_idx)
+    for src_f, src_a, w_f, w_a in zip(
+        eng_f.proj_table.src_idx, eng_a.proj_table.src_idx, eng_f.proj_table.weights, eng_a.proj_table.weights
+    ):
+        np.testing.assert_array_equal(np.asarray(src_f), np.asarray(src_a))
+        np.testing.assert_array_equal(np.asarray(w_f), np.asarray(w_a))
     # the shared engine projects the new basis' overlap exactly as the fresh one does
     tc_b = eng_a.evaluate_irreducible_two_center(struct, basis_b, pat_a, cfg)
     tc_f = eng_f.evaluate_irreducible_two_center(struct, basis_b, pat_f, cfg)
