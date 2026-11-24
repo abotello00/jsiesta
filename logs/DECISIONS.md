@@ -870,3 +870,49 @@
 - **Physics:** none; the engine and kernels are byte-identical to `ea4b882` except for docstring paths to the moved
   design documents.
 
+## D-046: SIESTA restart files: `.XV`, `.DM` and `.nc` in and out (2026-11-23)
+- **Status:** accepted; branch `feature/siesta-restart-io`. The exchange with a running SIESTA is not yet measured
+  (no SIESTA binary on the development machine); the test that does it is in place and skipped there.
+- **Why:** every run started cold, and nothing jsiesta computed could be handed to SIESTA or to tools that read
+  SIESTA files. Geometries, density matrices and Hamiltonians now move in both directions.
+- **Change:** new `jax_siesta/io/siesta_files.py`. `run_scf` takes `initial_dm` and `initial_h`;
+  `run_single_point` and its CLI take `--read-xv`, `--read-dm`, `--read-nc`, `--write-restart`, `--label`;
+  `parse_fdf` returns the restart keywords (`SystemLabel`, `MD.UseSaveXV`, `DM.UseSaveDM`, `UseSaveData`,
+  `File.DM.Init`, `CDF.Save`, `SaveHS`) under `"io"`. `netCDF4` is an optional dependency (`[netcdf]`), imported
+  only when a `.nc` file is touched.
+- **Sparsity layout:** a jsiesta edge `(src, dst, T)` is SIESTA's element `(io = src, column = isc * no_u + dst)`
+  with `isc = i1 + nsc1 (i2 + nsc2 i3)` and offset `i` or `i - nsc` above `nsc / 2` (`superx`, `linear2pm`). Files are
+  written with the smallest odd `nsc` that holds the pattern; SIESTA re-indexes any `nsc` on reading. Reading matches
+  elements by `(row, column orbital, offset)`, so another `nsc`, unsorted columns (SIESTA's own files) and a
+  different pattern are all handled; unmatched elements are dropped or left zero, as in SIESTA.
+- **Files without auxiliary supercell** (Gamma-only SIESTA runs, `nsc = 1`): the stored element is the sum over
+  images. The density matrix is replicated to every image (exact at Gamma, where `D(T)` does not depend on `T`;
+  SIESTA does the same). The Hamiltonian is put on one image, which keeps `H(Gamma)` only: valid for a Gamma-only
+  restart, not for k-point sampling.
+- **Spin components** (from `diag3k.F` and its notes): SIESTA's `D^{ss'}(io, jo) = c_{io,s} c*_{jo,s'}` is the jsiesta
+  edge value, stored as `(Re uu, Re dd, Re ud, -Im ud, Im uu, Im dd, Re du, Im du)`. SIESTA's
+  `H^{ss'}(io, jo) = <jo s|H|io s'>` is the conjugate of the jsiesta edge value with the spins exchanged, so
+  `H5, H6 = -Im h^uu, -Im h^dd`, `H7 + iH8 = (h^ud)^*` and `H3 - iH4 = h^ud` of the transposed edge. `H`, `EDM` and `Ef`
+  are in Ry in the files.
+- **Warm start semantics:** `initial_dm` replaces the cold-start density matrix, is rescaled to the electron count
+  (as SIESTA's `normalize_dm`) and symmetry-projected; the first Hamiltonian is `H[D]`, as in a SIESTA restart.
+  `initial_h` is the first input Hamiltonian under Hamiltonian mixing; alone, the starting density matrix is the one
+  it produces. Under density-matrix mixing `H_in = H[D_in]` always, so `initial_h` only builds `D_in` when no density
+  matrix is given. A file with another number of spin components is converted (`convert_spin`).
+- **What SIESTA can read:** `.XV` (`MD.UseSaveXV`) and `.DM` (`DM.UseSaveDM`, `File.DM.Init`). SIESTA has no reader
+  that restarts from a Hamiltonian, in any format, so the `.nc` file is a restart file for jsiesta and an exchange
+  file for tools (sisl, TBtrans-style post-processing), not an input to SIESTA's SCF.
+- **Checked (`tests/test_siesta_files.py`):** files written by SIESTA (`Tests/14.FileIO/save_dm.DM`,
+  `Tests/15.TDDFT/TDDFT_h2o.{DM,XV}`) are read and written back byte for byte. The spin conventions reproduce a
+  literal transcription of `diag3k`'s Hamiltonian assembly and density-matrix extraction for `nspin` 4 and 8 to 1e-10
+  (density matrix from jsiesta's own eigensolver). Round trips are exact for `nspin` 1, 2, 4, 8. Bulk Si, 2x2x2
+  k-points: a restart from the `.DM` file, from `H`, or from `H` and `DM` of the `.nc` file converges in at most 3
+  iterations (cold: more) to the same energy within 1e-7 Ha, under both mixing targets. Outside the suite: sisl 0.20
+  reads the `.nc` file and gives `S(k)` to 4e-16, `H(k)` to 2e-12 eV, `Tr[D S] = 8` and the Fermi level.
+- **Not checked:** SIESTA reading the jsiesta `.DM`/`.XV`, and jsiesta starting from a SIESTA `.DM`/`.nc` of the same
+  system (`test_siesta_reads_jsiesta_files_and_jsiesta_reads_siesta_files`, needs `siesta_bin` and
+  `pseudodojo_sr_pbe_dir`; it was written without a SIESTA binary to run it against). The `nspin` 4 and 8 conventions
+  rest on the `diag3k` transcription, not on a SIESTA run.
+- **Not written:** velocities (zero), the `GRID` group and the radial tables of the `BASIS` group of the `.nc` file,
+  `.HSX`, `.TSHS` and `DMHS.nc`.
+

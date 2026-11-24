@@ -262,3 +262,18 @@
   documentation index (now the external reference `siesta_doc_index`), and results staleness ignored a missing HEAD.
   `make check` in the release tree; one initial commit.
 
+### 2026-11-23 — SIESTA restart files (D-046), branch `feature/siesta-restart-io` (Claude Code)
+- New `jax_siesta/io/siesta_files.py`: `.XV`, `.DM` (Fortran unformatted) and `.nc` (`CDF.Save` layout, NetCDF-4)
+  readers and writers, the sparsity and spin-component conversions, `convert_spin`, `normalize_dm`,
+  `write_restart_files`. `run_scf(initial_dm=, initial_h=)`; runner flags `--read-xv/--read-dm/--read-nc/
+  --write-restart/--label`; restart keywords in `parse_fdf`. Formats and conventions taken from SIESTA `dev`
+  (`ioxv.F`, `m_iodm.F90`, `io_sparse.F90`, `m_ncdf_siesta.F90`, `ncdf_io.F90`, `atomlist.f`, `m_handle_sparse.F90`,
+  `diag3k.F`).
+- `tests/test_siesta_files.py`: 28 tests pass without SIESTA; the byte-for-byte test passes against a SIESTA source
+  tree (`JSIESTA_SIESTA_PSEUDOS_DIR`); the test that runs SIESTA is skipped on this machine (no binary). sisl 0.20
+  read the written `.nc` file correctly (manual check).
+- Machine notes: no SIESTA binary, Libxc or Doxygen here. The library was built with `-DJSIESTA_USE_LIBXC=OFF`
+  (built-in XC kernels), so tests that need Libxc and the Doxygen half of `make docs` did not run; ruff, mypy and
+  Sphinx `-W` pass.
+- Next: run `tests/test_siesta_files.py` where `siesta_bin` and `pseudodojo_sr_pbe_dir` are configured.
+

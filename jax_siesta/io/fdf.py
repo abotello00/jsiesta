@@ -68,7 +68,9 @@ def parse_fdf(fdf_path: str | Path) -> dict[str, Any]:
         fdf_path: Path to ``.fdf`` input file.
 
     Returns:
-        Dictionary of parsed structure fields and ``SCFConfig`` keyword overrides.
+        Dictionary of parsed structure fields and ``SCFConfig`` keyword overrides. Its ``"io"`` entry holds the
+        restart-file keywords (``SystemLabel``, ``MD.UseSaveXV``, ``DM.UseSaveDM``, ``UseSaveData``,
+        ``File.DM.Init``, ``CDF.Save``, ``SaveHS``) for ``jax_siesta.io.siesta_files``.
 
     Invariants:
         Raises ``ValueError`` if required ``%block`` tags are unclosed.
@@ -230,7 +232,22 @@ def parse_fdf(fdf_path: str | Path) -> dict[str, Any]:
         mix_history=n_pulay,
         **mix_kwargs,
     )
-    return {"structure": structure, "config": config, "k_grid": k_grid, "mesh_sizes": mesh_sizes}
+    def _flag(key: str, default: bool) -> bool:
+        if key not in scalars:
+            return default
+        # A bare FDF logical key means true.
+        return (scalars[key][0].lower() if scalars[key] else "t") in ("t", "true", ".true.", "yes", "y", "1")
+
+    label = scalars["systemlabel"][0] if scalars.get("systemlabel") else "siesta"
+    restart_io = {
+        "system_label": label,
+        "use_save_xv": _flag("mdusesavexv", _flag("usesavedata", False)),
+        "use_save_dm": _flag("dmusesavedm", _flag("usesavedata", False)),
+        "dm_init_file": scalars["filedminit"][0] if scalars.get("filedminit") else f"{label}.DM",
+        "cdf_save": _flag("cdfsave", False),
+        "save_hs": _flag("savehs", False),
+    }
+    return {"structure": structure, "config": config, "k_grid": k_grid, "mesh_sizes": mesh_sizes, "io": restart_io}
 
 
 def load_case_json(case_json_path: str | Path) -> dict[str, Any]:
