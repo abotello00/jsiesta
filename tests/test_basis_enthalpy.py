@@ -334,7 +334,8 @@ def test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage() ->
 
     # Smoke check automatic space builder from PSML
     auto_space = default_opt_space_from_psml({"Si": psml}, basis_size="DZP", xc="PBE")
-    assert auto_space.ndim > 9
+    # q + (rc_z1, V0, rc_z2, ri) for 3s and 3p; the perturbative 3d polarisation takes 3p's cut-off and confinement
+    assert auto_space.ndim == 9 and not any("_3d_" in name for name in auto_space.active_names)
     assert abs(to_optimizer_u(to_physical_x(0.7, 1.0, 5.0), 1.0, 5.0) - 0.7) < 1e-10
 
 
@@ -405,4 +406,64 @@ def test_symmetry_setup_cache_reuses_the_engine_while_the_neighbour_set_is_uncha
     np.testing.assert_array_equal(
         np.asarray(eng_a.project_matrix(tc_b.overlap[None, :], 1)), np.asarray(eng_f.project_matrix(tc_f.overlap[None, :], 1))
     )
+
+
+@pytest.mark.external_refs("siesta_bin", "pseudodojo_sr_pbe_dir")
+def test_exported_polarised_basis_matches_siesta(tmp_path: Path) -> None:
+    """The exported DZP block (perturbative polarisation as SIESTA's ``P`` flag, soft confinement) reproduces in SIESTA
+    the orbitals jsiesta generates: same cut-offs, overlapping radial shapes, polarisation cut-off = parent's."""
+    import subprocess
+
+    from jax_siesta.testing.siesta_adapter import write_siesta_fdf
+
+    psml_dir = ref_path("pseudodojo_sr_pbe_dir")
+    siesta = ref_path("siesta_bin")
+    assert psml_dir is not None and siesta is not None
+    psml = {"Si": psml_dir / "Si.psml", "C": psml_dir / "C.psml"}
+    space = default_opt_space_from_psml(psml, basis_size="DZP", xc="PBE")
+    assert not any("_2d_" in name or "_3d_" in name for name in space.active_names)  # no polarisation parameters
+    _, specs = space.decode_to_species_specs(space.initial_u())
+    block = format_pao_basis_block(specs)
+    assert "P 1" in block and "  2  1" not in block.replace("n=2  1", "")
+
+    # SIESTA: one C and one Si atom, far apart in a box; only the basis generation matters
+    box = 24.0
+    cell = jnp.eye(3, dtype=jnp.float64) * box
+    struct = Structure(
+        cell=cell,
+        positions=jnp.array([[0.0, 0.0, 0.0], [0.5 * box, 0.5 * box, 0.5 * box]]),
+        species_indices=(0, 1),
+        atomic_numbers=(14, 6),
+        species_labels=("Si", "C"),
+        initial_moments=jnp.zeros((2, 3)),
+    )
+    cfg = SCFConfig(nspin=1, xc_functional="PBE", mesh_cutoff_ry=40.0, max_scf_iterations=1, d_tol=1e-3, h_tol_ha=1e-3)
+    for lbl, path in psml.items():
+        (tmp_path / f"{lbl}.psml").write_bytes(path.read_bytes())
+    fdf = write_siesta_fdf(tmp_path, {"structure": struct, "config": cfg, "k_grid": (1, 1, 1)}, system_label="exp")
+    fdf.write_text(fdf.read_text().replace("PAO.BasisSize DZP", block).replace("SCF.MustConverge true", "SCF.MustConverge false"))
+    with fdf.open("rb") as fin, (tmp_path / "out").open("wb") as fout:
+        proc = subprocess.run([str(siesta)], stdin=fin, stdout=fout, stderr=subprocess.STDOUT, cwd=tmp_path, check=False)
+    out = (tmp_path / "out").read_text(errors="replace")
+    assert (tmp_path / "C.ion.xml").is_file(), out[-2000:]
+    assert proc.returncode == 0 or "SCF did not converge" in out or "SCF_NOT_CONV" in out, out[-2000:]
+
+    loader = PSMLBasisLoader()
+    for lbl in ("Si", "C"):
+        sp_js, _ = generate_species_from_psml(psml[lbl], basis_spec=specs[lbl], xc="PBE")
+        sp_si = loader.load_species(lbl, str(psml[lbl]), ion_path=str(tmp_path / f"{lbl}.ion.xml"))
+        assert sp_si.pao_l == sp_js.pao_l and sp_si.pao_zeta == sp_js.pao_zeta, (lbl, sp_si.pao_l, sp_js.pao_l)
+        r = np.linspace(0.0, max(max(sp_si.pao_rcut), max(sp_js.pao_rcut)), 4000)
+        for i, (ang_l, zeta) in enumerate(zip(sp_js.pao_l, sp_js.pao_zeta, strict=True)):
+            assert abs(sp_si.pao_rcut[i] - sp_js.pao_rcut[i]) < 0.05, (lbl, ang_l, zeta, sp_si.pao_rcut[i], sp_js.pao_rcut[i])
+            f_si = np.interp(r, np.asarray(sp_si.pao_r), np.asarray(sp_si.pao_values[i]), right=0.0)
+            f_js = np.interp(r, np.asarray(sp_js.pao_r), np.asarray(sp_js.pao_values[i]), right=0.0)
+            w = r**2
+            overlap = np.trapezoid(w * f_si * f_js, r) / np.sqrt(np.trapezoid(w * f_si**2, r) * np.trapezoid(w * f_js**2, r))
+            assert overlap > 0.999, (lbl, ang_l, zeta, overlap)
+        # the polarisation orbital (largest l) has the cut-off of the parent's first zeta
+        l_pol = max(sp_js.pao_l)
+        i_pol = sp_js.pao_l.index(l_pol)
+        i_par = [i for i, (ang_l, zeta) in enumerate(zip(sp_js.pao_l, sp_js.pao_zeta, strict=True)) if ang_l == l_pol - 1 and zeta == 1][-1]
+        assert abs(sp_js.pao_rcut[i_pol] - sp_js.pao_rcut[i_par]) < 1e-9
 

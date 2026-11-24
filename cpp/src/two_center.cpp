@@ -23,9 +23,11 @@
 #include "jsiesta/threading.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -174,67 +176,102 @@ struct PairRadialSplines {
     std::vector<jsiesta::math::UniformCubicSpline> splines;
 };
 
-PairRadialSplines build_pair_splines(
-    const RadialTransform& rt1, const RadialTransform& rt2,
-    const std::vector<double>& k_pts, const std::vector<double>& k_wts,
-    bool is_kinetic) {
-    PairRadialSplines prs;
-    prs.l1 = rt1.l;
-    prs.l2 = rt2.l;
-    prs.rcut_pair = rt1.rcut + rt2.rcut;
-    const int l_min = std::abs(rt1.l - rt2.l);
-    const int l_max = rt1.l + rt2.l;
-    const double r_max = std::max(prs.rcut_pair + 0.5, 1.0);
+// Transforms of n radial functions (function s at values + s * n_pts), threaded over functions (same values).
+void hankel_transforms(std::vector<RadialTransform>& out, int n, const double* values, int n_pts, const double* r_max,
+                       const double* r_cut, const int32_t* l, const std::vector<double>& k_pts) {
+    out.resize(static_cast<size_t>(n));
+    jsiesta::threading::parallel_ranges(n, jsiesta::threading::thread_count(n, 2), [&](int, int64_t lo, int64_t hi) {
+        for (int64_t s = lo; s < hi; ++s) {
+            out[static_cast<size_t>(s)] = hankel_transform(values + static_cast<size_t>(s) * n_pts, n_pts, r_max[s], r_cut[s],
+                                                           l == nullptr ? 0 : l[s], k_pts);
+        }
+    });
+}
+
+// One shell pair of a table group: its transforms and where its n_out tables go.
+struct PairJob {
+    const RadialTransform* rt1;
+    const RadialTransform* rt2;
+    PairRadialSplines* out;
+};
+
+// Radial tables F_{l1 l2 L}(R) / R^L of a group of shell pairs with the same r_c1 + r_c2 and the same l1 + l2, so the
+// same R grid and the same spherical Bessel values: per pair, out[0] with the overlap weight k^2 and, if n_out == 2,
+// out[1] with the kinetic weight k^4 / 2. Each Bessel value is computed once for the group; every curve is accumulated
+// exactly as a build of that pair alone would (same values).
+void build_pair_group(const std::vector<PairJob>& group, const std::vector<double>& k_pts,
+                      const std::vector<double>& k_wts, int n_out) {
+    const double rcut_pair = group[0].rt1->rcut + group[0].rt2->rcut;
+    const int l_max = group[0].rt1->l + group[0].rt2->l;
+    const double r_max = std::max(rcut_pair + 0.5, 1.0);
     const double dr = r_max / static_cast<double>(kNumRSpline - 1);
+    const size_t n_k = k_pts.size();
+    const size_t n_pairs = group.size();
 
-    for (int L = l_min; L <= l_max; L += 2) {
-        prs.L_vals.push_back(L);
+    // per pair: its L values, its k weights per variant, its curves [j][iL][ir]
+    std::vector<std::vector<int>> L_vals(n_pairs);
+    std::vector<std::vector<std::vector<double>>> w_prod_k(n_pairs);
+    std::vector<std::vector<std::vector<std::vector<double>>>> curves(n_pairs);
+    for (size_t p = 0; p < n_pairs; ++p) {
+        const RadialTransform& rt1 = *group[p].rt1;
+        const RadialTransform& rt2 = *group[p].rt2;
+        for (int L = std::abs(rt1.l - rt2.l); L <= l_max; L += 2) L_vals[p].push_back(L);
+        const int n_L = static_cast<int>(L_vals[p].size());
+        curves[p].assign(n_out, std::vector<std::vector<double>>(n_L, std::vector<double>(kNumRSpline, 0.0)));
+        // the k weights times the transforms do not depend on R: computed once (same values)
+        w_prod_k[p].assign(n_out, std::vector<double>(n_k));
+        for (int j = 0; j < n_out; ++j) {
+            for (size_t ik = 0; ik < n_k; ++ik) {
+                const double k = k_pts[ik];
+                const double k_factor = (j == 1) ? (0.5 * k * k * k * k) : (k * k);
+                w_prod_k[p][j][ik] = k_wts[ik] * k_factor * rt1.f_k[ik] * rt2.f_k[ik];
+            }
+        }
     }
-    const int n_L = static_cast<int>(prs.L_vals.size());
-    std::vector<std::vector<double>> curves(n_L, std::vector<double>(kNumRSpline, 0.0));
-    std::vector<double> jl(l_max + 1, 0.0);
-
     // Precompute double factorial (2L + 1)!! for R -> 0 limit: j_L(kR) / R^L -> k^L / (2L+1)!!
     std::vector<double> dfact(l_max + 1, 1.0);
     for (int L = 1; L <= l_max; ++L) {
         dfact[L] = dfact[L - 1] * static_cast<double>(2 * L + 1);
     }
 
-    // the k weights times the transforms and R^L do not depend on R and k respectively: computed once (same values)
-    std::vector<double> w_prod_k(k_pts.size());
-    for (size_t ik = 0; ik < k_pts.size(); ++ik) {
-        const double k = k_pts[ik];
-        const double k_factor = is_kinetic ? (0.5 * k * k * k * k) : (k * k);
-        w_prod_k[ik] = k_wts[ik] * k_factor * rt1.f_k[ik] * rt2.f_k[ik];
-    }
-    std::vector<double> r_pow_L(n_L, 1.0);
+    std::vector<double> jl(l_max + 1, 0.0);
+    std::vector<double> r_pow_L(l_max + 1, 1.0);  // R^L, the same for every k
+    std::vector<double> j_over_rL(l_max + 1, 0.0);
     for (int ir = 0; ir < kNumRSpline; ++ir) {
         const double R = static_cast<double>(ir) * dr;
-        for (int iL = 0; iL < n_L; ++iL) r_pow_L[iL] = std::pow(R, prs.L_vals[iL]);
-        for (size_t ik = 0; ik < k_pts.size(); ++ik) {
+        for (int L = 0; L <= l_max; ++L) r_pow_L[L] = std::pow(R, L);
+        for (size_t ik = 0; ik < n_k; ++ik) {
             const double k = k_pts[ik];
-            const double w_prod = w_prod_k[ik];
             if (R < 1e-6) {
-                for (int iL = 0; iL < n_L; ++iL) {
-                    const int L = prs.L_vals[iL];
-                    const double j_over_rL = std::pow(k, L) / dfact[L];
-                    curves[iL][ir] += w_prod * j_over_rL;
-                }
+                for (int L = 0; L <= l_max; ++L) j_over_rL[L] = std::pow(k, L) / dfact[L];
             } else {
                 jsiesta::math::spherical_bessel_jl(l_max, k * R, jl.data());
-                for (int iL = 0; iL < n_L; ++iL) {
-                    const int L = prs.L_vals[iL];
-                    curves[iL][ir] += w_prod * (jl[L] / r_pow_L[iL]);
+                for (int L = 0; L <= l_max; ++L) j_over_rL[L] = jl[L] / r_pow_L[L];
+            }
+            for (size_t p = 0; p < n_pairs; ++p) {
+                const std::vector<int>& Ls = L_vals[p];
+                for (int j = 0; j < n_out; ++j) {
+                    const double w = w_prod_k[p][j][ik];
+                    std::vector<std::vector<double>>& c = curves[p][j];
+                    for (size_t iL = 0; iL < Ls.size(); ++iL) c[iL][ir] += w * j_over_rL[Ls[iL]];
                 }
             }
         }
     }
 
-    prs.splines.resize(n_L);
-    for (int iL = 0; iL < n_L; ++iL) {
-        prs.splines[iL].build(curves[iL].data(), kNumRSpline, r_max, prs.rcut_pair);
+    for (size_t p = 0; p < n_pairs; ++p) {
+        for (int j = 0; j < n_out; ++j) {
+            PairRadialSplines& prs = group[p].out[j];
+            prs.l1 = group[p].rt1->l;
+            prs.l2 = group[p].rt2->l;
+            prs.rcut_pair = rcut_pair;
+            prs.L_vals = L_vals[p];
+            prs.splines.resize(L_vals[p].size());
+            for (size_t iL = 0; iL < L_vals[p].size(); ++iL) {
+                prs.splines[iL].build(curves[p][j][iL].data(), kNumRSpline, r_max, rcut_pair);
+            }
+        }
     }
-    return prs;
 }
 
 void eval_pair_element(
@@ -337,17 +374,27 @@ void build_missing_pairs(PairTableSet& set, const std::vector<int>& needed, cons
         if (!set.built[static_cast<size_t>(pid)]) todo.push_back(pid);
     }
     const int n_b = static_cast<int>(set.rts_b.size());
-    const int n_tab = set.n_per_pair * static_cast<int>(todo.size());
-    jsiesta::threading::parallel_ranges(
-        n_tab, jsiesta::threading::thread_count(n_tab, 2), [&](int, int64_t lo, int64_t hi) {
-            for (int64_t i = lo; i < hi; ++i) {
-                const int pid = todo[static_cast<size_t>(i / set.n_per_pair)];
-                const int j = static_cast<int>(i % set.n_per_pair);
-                set.tables[static_cast<size_t>(pid * set.n_per_pair + j)] =
-                    build_pair_splines(set.rts_a[static_cast<size_t>(pid / n_b)], set.rts_b[static_cast<size_t>(pid % n_b)],
-                                       k_pts, k_wts, j == 1);
-            }
-        });
+    // pairs with the same r_c1 + r_c2 and l1 + l2 share their R grid and Bessel values: one task per such group
+    std::vector<std::vector<PairJob>> groups;
+    std::vector<std::pair<double, int>> group_keys;
+    for (const int pid : todo) {
+        const RadialTransform* rt1 = &set.rts_a[static_cast<size_t>(pid / n_b)];
+        const RadialTransform* rt2 = &set.rts_b[static_cast<size_t>(pid % n_b)];
+        const std::pair<double, int> key{rt1->rcut + rt2->rcut, rt1->l + rt2->l};
+        size_t g = 0;
+        while (g < group_keys.size() && group_keys[g] != key) ++g;
+        if (g == group_keys.size()) {
+            group_keys.push_back(key);
+            groups.emplace_back();
+        }
+        groups[g].push_back({rt1, rt2, &set.tables[static_cast<size_t>(pid * set.n_per_pair)]});
+    }
+    // groups are handed out one at a time: their costs differ widely
+    const int n_groups = static_cast<int>(groups.size());
+    std::atomic<int> next{0};
+    jsiesta::threading::run_threads(jsiesta::threading::thread_count(n_groups, 2), [&](int) {
+        for (int g = next++; g < n_groups; g = next++) build_pair_group(groups[static_cast<size_t>(g)], k_pts, k_wts, set.n_per_pair);
+    });
     for (const int pid : todo) set.built[static_cast<size_t>(pid)] = 1;
 }
 
@@ -403,12 +450,7 @@ int32_t jsiesta_eval_two_center_st(
         bool is_new = false;
         set = find_table_set(cache, std::move(key), is_new);
         if (is_new) {
-            set->rts_a.resize(n_shells);
-            for (int s = 0; s < n_shells; ++s) {
-                set->rts_a[s] = hankel_transform(
-                    pao_values + static_cast<size_t>(s) * n_pao_pts,
-                    n_pao_pts, pao_r_max[s], pao_rcut[s], pao_l[s], k_pts);
-            }
+            hankel_transforms(set->rts_a, n_shells, pao_values, n_pao_pts, pao_r_max, pao_rcut, pao_l, k_pts);
             set->rts_b = set->rts_a;
             set->n_per_pair = 2;
             set->tables.resize(static_cast<size_t>(2 * n_pairs));
@@ -511,18 +553,8 @@ int32_t jsiesta_eval_kb_overlaps(
         bool is_new = false;
         set = find_table_set(cache, std::move(key), is_new);
         if (is_new) {
-            set->rts_a.resize(n_pao_shells);
-            set->rts_b.resize(n_kb_shells);
-            for (int s = 0; s < n_pao_shells; ++s) {
-                set->rts_a[s] = hankel_transform(
-                    pao_values + static_cast<size_t>(s) * n_pao_pts,
-                    n_pao_pts, pao_r_max[s], pao_rcut[s], pao_l[s], k_pts);
-            }
-            for (int k = 0; k < n_kb_shells; ++k) {
-                set->rts_b[k] = hankel_transform(
-                    kb_values + static_cast<size_t>(k) * n_kb_pts,
-                    n_kb_pts, kb_r_max[k], kb_rcut[k], kb_l[k], k_pts);
-            }
+            hankel_transforms(set->rts_a, n_pao_shells, pao_values, n_pao_pts, pao_r_max, pao_rcut, pao_l, k_pts);
+            hankel_transforms(set->rts_b, n_kb_shells, kb_values, n_kb_pts, kb_r_max, kb_rcut, kb_l, k_pts);
             set->n_per_pair = 1;
             set->tables.resize(static_cast<size_t>(n_pao_shells * n_kb_shells));
             set->built.assign(static_cast<size_t>(n_pao_shells * n_kb_shells), 0);
@@ -577,16 +609,15 @@ int32_t jsiesta_eval_na_pair(
     std::vector<double> k_pts, k_wts;
     compute_k_grid(k_pts, k_wts);
 
-    std::vector<RadialTransform> rts(n_species);
-    for (int s = 0; s < n_species; ++s) {
-        rts[s] = hankel_transform(
-            rho_na + static_cast<size_t>(s) * n_pts,
-            n_pts, r_max[s], rcut_na[s], 0, k_pts);
-    }
+    std::vector<RadialTransform> rts;
+    hankel_transforms(rts, n_species, rho_na, n_pts, r_max, rcut_na, nullptr, k_pts);
 
+    // the species-pair splines are independent: threaded over pairs
     std::vector<jsiesta::math::UniformCubicSpline> na_splines(n_species * n_species);
-    for (int s1 = 0; s1 < n_species; ++s1) {
-        for (int s2 = 0; s2 < n_species; ++s2) {
+    const int n_sp_pairs = n_species * n_species;
+    jsiesta::threading::parallel_ranges(n_sp_pairs, jsiesta::threading::thread_count(n_sp_pairs, 2), [&](int, int64_t lo, int64_t hi) {
+        for (int64_t sp = lo; sp < hi; ++sp) {
+            const int s1 = static_cast<int>(sp / n_species), s2 = static_cast<int>(sp % n_species);
             const double rc_pair = rcut_na[s1] + rcut_na[s2];
             const double r_span = std::max(rc_pair + 0.5, 1.0);
             const double dr = r_span / static_cast<double>(kNumRSpline - 1);
@@ -610,7 +641,7 @@ int32_t jsiesta_eval_na_pair(
             }
             na_splines[s1 * n_species + s2].build(curve.data(), kNumRSpline, r_span, rc_pair);
         }
-    }
+    });
 
     for (int p = 0; p < n_pairs; ++p) {
         const int s1 = pair_sp1[p];

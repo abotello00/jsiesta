@@ -295,3 +295,11 @@
 - A100 jobs 29639602 and 29639684: SiC per evaluation 1.86 s (GPU), 5.0 s (18 CPU threads), SIESTA 23.8 s.
 - Tried and dropped an SCF warm start from the previous density matrix (under 10 % fewer iterations).
 
+### 2026-11-24 — Basis optimisation, second round (D-050) (Claude Code)
+- Radial tables: shared Bessel values within groups of pairs on the same grid (S and T together), threaded Hankel
+  transforms and neutral-atom pair splines; bitwise identical.
+- Vectorised the symmetry-closed pattern and the projection table (identical pattern, weights to 1e-16).
+- Polarisation: SIESTA convention (no own parameters, parent's cut-off and confinement, `P` export) and SIESTA's
+  source term; new SIESTA test on the exported block.
+- A100 job 29646494: SiC DZP evaluation 1.32 s (was 1.86 s).
+

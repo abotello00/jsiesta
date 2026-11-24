@@ -264,6 +264,9 @@ class ShellOptConfig:
     Invariants:
         - ``n_zeta >= 1``.
         - ``is_polarization=True`` sets ``polarization_mode`` (``"perturbative"`` or ``"eigenstate"``).
+        - A perturbative polarisation shell has no parameters: it takes the cut-off of the parent's first zeta and
+          the parent's soft confinement (SIESTA convention); ``rc_guess``, ``v0_initial_ha`` and ``ri_initial_bohr``
+          are ignored for it.
 
     SIESTA Mapping:
         Generalizes shell entries in ``PAO.Basis`` for automated basis optimization.
@@ -416,6 +419,9 @@ class MappedBasisSpace:
                 frozen[q_name] = float(np.clip(q_val, q_bounds[0], q_bounds[1]))
 
             for sh in species_shells[sp_lbl]:
+                if sh.is_polarization and sh.polarization_mode == "perturbative":
+                    # SIESTA convention: cut-off and confinement are the parent shell's, so no parameters of its own
+                    continue
                 ll = _L_NAMES.get(sh.l, str(sh.l))
                 prefix = f"{sp_lbl}_{sh.n}{ll}"
                 use_sc = sh.optimize_soft_confinement
@@ -611,6 +617,19 @@ class MappedBasisSpace:
         for sp_lbl, sh_tuple in self.species_shells.items():
             shells_out: list[ShellBasisSpec] = []
             for sh in sh_tuple:
+                if sh.is_polarization and sh.polarization_mode == "perturbative":
+                    # takes the parent's first-zeta cut-off and confinement in the generator (SIESTA "P")
+                    shells_out.append(
+                        ShellBasisSpec(
+                            n=sh.n,
+                            l=sh.l,
+                            n_zeta=sh.n_zeta,
+                            is_polarization=True,
+                            polarization_mode="perturbative",
+                            parent_l=sh.parent_l,
+                        )
+                    )
+                    continue
                 ll = _L_NAMES.get(sh.l, str(sh.l))
                 prefix = f"{sp_lbl}_{sh.n}{ll}"
                 rcs = tuple(float(params[f"{prefix}_rc_z{z}"]) for z in range(1, sh.n_zeta + 1))
@@ -1095,7 +1114,9 @@ def format_pao_basis_block(species_specs: dict[str, SpeciesBasisSpec]) -> str:
 
     Theory:
         Emits exact explicit per-zeta ``rc`` values, soft confinement ``E (2*V0_Ha) ri``,
-        and net ionic charge ``q`` in standard SIESTA FDF units (Bohr, Rydberg, e).
+        and net ionic charge ``q`` in standard SIESTA FDF units (Bohr, Rydberg, e). A perturbative
+        polarisation shell is written as the ``P n_zeta`` flag of its parent shell, SIESTA's form for it
+        (it takes the parent's first-zeta cut-off and confinement in both codes).
 
     Algorithm:
         Iterates species and shells, formatting FDF lines matching ``SiestaOpt/basis_block.py``.
@@ -1114,10 +1135,25 @@ def format_pao_basis_block(species_specs: dict[str, SpeciesBasisSpec]) -> str:
     """
     lines = ["%block PAO.Basis"]
     for sym, sp in species_specs.items():
-        lines.append(f"  {sym}  {len(sp.shells)}  {sp.ionic_charge:.5f}")
+        # perturbative polarisation is the "P n_zeta" flag of its parent shell (SIESTA's only form for it)
+        pol_of: dict[int, ShellBasisSpec] = {}
         for sh in sp.shells:
+            if sh.is_polarization and sh.polarization_mode == "perturbative":
+                par_l = sh.parent_l if sh.parent_l is not None else sh.l - 1
+                pol_of[par_l] = sh
+        main = [sh for sh in sp.shells if not (sh.is_polarization and sh.polarization_mode == "perturbative")]
+        parent_ls = {sh.l for sh in main}
+        missing = sorted(set(pol_of) - parent_ls)
+        if missing:
+            raise ValueError(f"{sym}: perturbative polarisation of l={missing} has no parent shell in the basis.")
+        lines.append(f"  {sym}  {len(main)}  {round(sp.ionic_charge, 5) + 0.0:.5f}")
+        for sh in main:
             rcs = sh.rc_list or (5.0,) * sh.n_zeta
-            hdr = [f"n={sh.n}", f"{sh.l}", f"{sh.n_zeta}"]
+            # an explicit shell is a confined eigenstate in SIESTA: its n is at least l + 1 (nodeless)
+            n_out = max(sh.n, sh.l + 1) if sh.is_polarization else sh.n
+            hdr = [f"n={n_out}", f"{sh.l}", f"{sh.n_zeta}"]
+            if sh.l in pol_of and sh is max((m for m in main if m.l == sh.l), key=lambda m: m.n):
+                hdr.append(f"P {pol_of[sh.l].n_zeta}")
             if sh.v0_ha != 0.0 or sh.ri_bohr > 0.0:
                 hdr.append(f"E {2.0 * sh.v0_ha:.3f} {sh.ri_bohr:.4f}")
             lines.append("  " + "  ".join(hdr))

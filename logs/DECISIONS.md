@@ -999,3 +999,36 @@
   rejects; SIESTA's form is the `P` flag on the parent shell, which also ties the polarisation cut-off to the parent's
   (the default optimisation space varies it independently). PAO generation from a PSML without semilocal potentials
   solves each radial state by a dense `eigh` (2.1 s per state on the 2398-point grid of the test fixture).
+
+## D-050: Basis optimisation, second round: radial tables, vectorised symmetry set-up, SIESTA polarisation convention (2026-11-24)
+- **Status:** accepted (branch `perf/basis-opt`); A100 timing in job 29646494.
+- **Why:** after D-049 the radial spline tables of each new basis were most of the two-centre cost (one table per
+  shell pair and variant, 615 k spherical Bessel values each, S and T built separately, the Hankel transforms and the
+  neutral-atom pair splines serial); a new neighbour set with symmetry cost 6.5 s of Python loops (closed pattern and
+  projection table, one iteration per block and operation; 306 s for 16 SiC atoms). Exporting an optimised DZP basis
+  to SIESTA failed: `format_pao_basis_block` wrote the perturbative polarisation shell as an explicit `n=2 l=2` shell
+  (SIESTA: "PAO 2d with n<n_valence should not be in PAO.Basis"), and the default optimisation space varied the
+  polarisation cut-off and confinement, which SIESTA ties to the parent shell (`atom.F`, `POLgen`). Running SIESTA on
+  a corrected block showed that the polarisation orbitals themselves differed (overlap 0.95-0.98 with SIESTA's; all
+  other orbitals above 0.9998).
+- **Change:** radial tables: pairs with the same `r_c1 + r_c2` and `l1 + l2` (so the same R grid and Bessel values),
+  including S and T of a pair, are built in one task that computes each Bessel value once; tasks are handed out
+  dynamically; the Hankel transforms and the neutral-atom pair splines are threaded (all bitwise identical).
+  Symmetry set-up: `build_symmetry_closed_pattern` and `compile_projection_table` work on arrays (all blocks of one
+  `(l1, l2)` class per operation, shifts and blocks looked up by integer codes); the closed pattern is identical, the
+  projection weights agree to 1e-16. Polarisation, SIESTA convention: a perturbative polarisation shell has no
+  optimisation parameters; the generator gives it the parent's first-zeta cut-off and the parent's soft confinement
+  (an explicit different value raises `ValueError`); its source term is SIESTA's, `r u_parent / (dr/di)^(3/2)` on the
+  logarithmic grid (SIESTA's Numerov recursion takes `-r u_parent` as the source of `g = u / sqrt(dr/di)`); the
+  export writes it as the `P n_zeta` flag of the parent shell.
+- **Effect:** SiC DZP, 3 lattice constants: two-centre per evaluation 1.28 s -> 0.64 s on the laptop; symmetry set-up
+  6.55 s -> 0.59 s (16 atoms: closed pattern 54 s -> 10.5 s, projection table 306 s -> 46 s). On the A100 a steady
+  evaluation 1.86 s -> 1.32 s (SIESTA 23.8 s for the same 3 runs), the first one 32.9 s -> 15.5 s. The DZP space of
+  SiC has 18 parameters instead of 22. Polarisation orbitals now overlap SIESTA's by 1.00000 with soft confinement
+  and 0.9995 without (grid snapping of r_c), C and Si.
+- **Physics:** the perturbative polarisation orbitals change (to SIESTA's); everything else unchanged (densities,
+  S, T, V_KB, E_NA of the 64-atom check bitwise identical; symmetric objective enthalpies identical to 6 decimals
+  before the polarisation change). New test `test_exported_polarised_basis_matches_siesta` (external: SIESTA and
+  PseudoDojo) runs SIESTA on the exported block and compares every orbital's cut-off and shape.
+- **Known limits:** larger symmetric cells still spend tens of seconds in the projection table (aggregation of many
+  entries); the textbook-source polarisation is no longer available.

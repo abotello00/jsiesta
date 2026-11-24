@@ -246,6 +246,57 @@ def _validate_sequential_shells(
     return shells, lookup
 
 
+def _shell_arrays(
+    basis: BasisData, sg: SpaceGroupData
+) -> tuple[list[tuple[int, int, int, int]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Shells of ``basis`` and, per shell, ``(atom, l, first orbital)`` plus the orbital-to-shell map and, per operation
+    and shell, the image shell (same ``l`` and ``iz`` on the image atom): ``(shells, sh_atom, sh_l, sh_mu0, orb_to_sh,
+    sh_map)``."""
+    shells, lookup = _validate_sequential_shells(basis)
+    sh_atom = np.asarray([sh[0] for sh in shells], dtype=np.int64)
+    sh_l = np.asarray([sh[1] for sh in shells], dtype=np.int64)
+    sh_mu0 = np.asarray([sh[3] for sh in shells], dtype=np.int64)
+    orb_to_sh = np.empty(basis.n_orb, dtype=np.int64)
+    for sh_i, (_, ang_l, _, mu0) in enumerate(shells):
+        orb_to_sh[mu0 : mu0 + 2 * ang_l + 1] = sh_i
+    sh_map = np.empty((sg.n_ops, len(shells)), dtype=np.int64)
+    for s in range(sg.n_ops):
+        for sh_i, (ia, ang_l, iz, _) in enumerate(shells):
+            sh_map[s, sh_i] = lookup[(int(sg.atom_map[s, ia]), ang_l, iz)]
+    return shells, sh_atom, sh_l, sh_mu0, orb_to_sh, sh_map
+
+
+def _image_shifts(sg: SpaceGroupData, s: int, t: np.ndarray, atom1: np.ndarray, atom2: np.ndarray) -> np.ndarray:
+    """Cell shifts :math:`W_S \\mathbf{T} + \\mathbf{n}_{S,J} - \\mathbf{n}_{S,I}` of shell pairs (one row each) under
+    operation ``s`` (integer arithmetic)."""
+    rot = np.asarray(sg.rotations_frac[s], dtype=np.int64)
+    atr = np.asarray(sg.atom_translation[s], dtype=np.int64)
+    return t @ rot.T + atr[atom2] - atr[atom1]
+
+
+def _unique_rows(rows: np.ndarray) -> np.ndarray:
+    """``np.unique(rows, axis=0)`` for small-range integer rows, through one int64 code per row (much faster)."""
+    if rows.shape[0] == 0:
+        return rows
+    lo = rows.min(axis=0)
+    span = rows.max(axis=0) - lo + 1
+    if float(np.prod(span.astype(np.float64))) >= 2.0**62:
+        return np.unique(rows, axis=0)
+    code = np.zeros(rows.shape[0], dtype=np.int64)
+    for col in range(rows.shape[1]):
+        code = code * int(span[col]) + (rows[:, col] - lo[col])
+    _, first = np.unique(code, return_index=True)
+    return rows[first]
+
+
+def _encode_rows(rows: np.ndarray, base: int) -> np.ndarray:
+    """Encode non-negative integer rows as one int64 per row, lexicographically ordered (``base`` > every entry)."""
+    code = np.zeros(rows.shape[0], dtype=np.int64)
+    for col in range(rows.shape[1]):
+        code = code * base + rows[:, col]
+    return code
+
+
 def build_symmetry_closed_pattern(
     structure: Structure,
     basis: BasisData,
@@ -281,7 +332,7 @@ def build_symmetry_closed_pattern(
     SIESTA Mapping:
         Replaces sparse-pattern closure around ``hsparse.F``.
     """
-    shells, lookup = _validate_sequential_shells(basis)
+    _validate_sequential_shells(basis)
     if base is None:
         base = build_sparse_pattern(structure, basis)
 
@@ -300,82 +351,68 @@ def build_symmetry_closed_pattern(
             symmetry_closed=True,
         )
 
-    orb_to_sh = np.empty(basis.n_orb, dtype=np.int32)
-    for sh_i, (_, ang_l, _, mu0) in enumerate(shells):
-        orb_to_sh[mu0 : mu0 + 2 * ang_l + 1] = sh_i
+    _, sh_atom, sh_l, sh_mu0, orb_to_sh, sh_map = _shell_arrays(basis, sg)
 
-    base_src = np.asarray(base.src_orb, dtype=np.int32)
-    base_dst = np.asarray(base.dst_unit_orb, dtype=np.int32)
-    base_eci = np.asarray(base.edge_cell_idx, dtype=np.int32)
-    base_sh = np.asarray(base.cell_shifts, dtype=np.int32)
+    # Distinct seed shell-pair edges (sh1, sh2, T) and their transposes, then their images under every operation
+    base_src = np.asarray(base.src_orb, dtype=np.int64)
+    base_dst = np.asarray(base.dst_unit_orb, dtype=np.int64)
+    base_t = np.asarray(base.cell_shifts, dtype=np.int64)[np.asarray(base.edge_cell_idx, dtype=np.int64)]
+    sh1 = orb_to_sh[base_src]
+    sh2 = orb_to_sh[base_dst]
+    seeds = _unique_rows(np.concatenate([np.column_stack([sh1, sh2, base_t]), np.column_stack([sh2, sh1, -base_t])]))
+    images = []
+    for s in range(sg.n_ops):
+        a1, a2 = sh_map[s, seeds[:, 0]], sh_map[s, seeds[:, 1]]
+        tp = _image_shifts(sg, s, seeds[:, 2:5], sh_atom[seeds[:, 0]], sh_atom[seeds[:, 1]])
+        images.append(np.column_stack([a1, a2, tp]))
+        images.append(np.column_stack([a2, a1, -tp]))
+    closed = _unique_rows(np.concatenate(images))  # (n_blocks, 5): sh1, sh2, T, sorted
 
-    # Deduplicate initial shell-pair edges (sh1, sh2, t0, t1, t2)
-    seed_shell_edges: set[tuple[int, int, int, int, int]] = set()
-    for e_i in range(base.n_edges):
-        sh1 = int(orb_to_sh[base_src[e_i]])
-        sh2 = int(orb_to_sh[base_dst[e_i]])
-        t = (int(base_sh[base_eci[e_i], 0]), int(base_sh[base_eci[e_i], 1]), int(base_sh[base_eci[e_i], 2]))
-        seed_shell_edges.add((sh1, sh2, t[0], t[1], t[2]))
-        seed_shell_edges.add((sh2, sh1, -t[0], -t[1], -t[2]))
+    # Canonical sorted cell_shifts with (0,0,0) at index 0
+    uniq_t = _unique_rows(np.concatenate([closed[:, 2:5], np.zeros((1, 3), dtype=np.int64)]))
+    nonzero = np.any(uniq_t != 0, axis=1)
+    cell_shifts_np = np.concatenate([np.zeros((1, 3), dtype=np.int64), uniq_t[nonzero]]).astype(np.int32)
+    n_c = cell_shifts_np.shape[0]
+    t_off = int(np.max(np.abs(cell_shifts_np))) if n_c else 0
+    t_base = 2 * t_off + 1
+    t_codes = _encode_rows(cell_shifts_np.astype(np.int64) + t_off, t_base)
+    t_order = np.argsort(t_codes)
 
-    closed_shell_edges: set[tuple[int, int, int, int, int]] = set()
-    for sh1, sh2, t0, t1, t2 in seed_shell_edges:
-        ia1, l1, iz1, _ = shells[sh1]
-        ia2, l2, iz2, _ = shells[sh2]
-        t_vec = np.array([t0, t1, t2], dtype=np.int32)
-        for s in range(sg.n_ops):
-            ja1 = int(sg.atom_map[s, ia1])
-            ja2 = int(sg.atom_map[s, ia2])
-            sh1_p = lookup[(ja1, l1, iz1)]
-            sh2_p = lookup[(ja2, l2, iz2)]
-            tp = sg.rotations_frac[s] @ t_vec + sg.atom_translation[s, ia2] - sg.atom_translation[s, ia1]
-            tp0, tp1, tp2 = int(tp[0]), int(tp[1]), int(tp[2])
-            closed_shell_edges.add((sh1_p, sh2_p, tp0, tp1, tp2))
-            closed_shell_edges.add((sh2_p, sh1_p, -tp0, -tp1, -tp2))
+    def _shift_index(t: np.ndarray) -> np.ndarray:
+        pos = np.searchsorted(t_codes[t_order], _encode_rows(t + t_off, t_base))
+        return t_order[pos]
 
-    # Build canonical sorted cell_shifts with (0,0,0) at index 0
-    shift_set = {(0, 0, 0)} | {(t0, t1, t2) for (_, _, t0, t1, t2) in closed_shell_edges}
-    other_shifts = sorted(s for s in shift_set if s != (0, 0, 0))
-    cell_shifts_list = [(0, 0, 0)] + other_shifts
-    shift_to_idx = {s: idx for idx, s in enumerate(cell_shifts_list)}
-    cell_shifts_np = np.asarray(cell_shifts_list, dtype=np.int32)
+    block_c = _shift_index(closed[:, 2:5])
 
-    # Expand shell-pair blocks into individual orbital pairs grouped per row src_orb
-    edges_per_row: list[list[tuple[int, int]]] = [[] for _ in range(basis.n_orb)]
-    for sh1, sh2, t0, t1, t2 in closed_shell_edges:
-        _, l1, _, mu0 = shells[sh1]
-        _, l2, _, nu0 = shells[sh2]
-        c_idx = shift_to_idx[(t0, t1, t2)]
-        for mu in range(mu0, mu0 + 2 * l1 + 1):
-            for nu in range(nu0, nu0 + 2 * l2 + 1):
-                edges_per_row[mu].append((nu, c_idx))
-
-    row_ptr = np.zeros(basis.n_orb + 1, dtype=np.int32)
-    src_list: list[int] = []
-    dst_list: list[int] = []
-    eci_list: list[int] = []
-    edge_lookup: dict[tuple[int, int, int], int] = {}
-
-    for mu in range(basis.n_orb):
-        row_items = sorted(set(edges_per_row[mu]), key=lambda pair: (pair[1], pair[0]))
-        for nu, c_idx in row_items:
-            e_idx = len(src_list)
-            src_list.append(mu)
-            dst_list.append(nu)
-            eci_list.append(c_idx)
-            edge_lookup[(mu, nu, c_idx)] = e_idx
-        row_ptr[mu + 1] = len(src_list)
-
-    src_arr = np.asarray(src_list, dtype=np.int32)
-    dst_arr = np.asarray(dst_list, dtype=np.int32)
-    eci_arr = np.asarray(eci_list, dtype=np.int32)
+    # Expand shell-pair blocks into orbital pairs (mu, nu, c), one group of blocks per (l1, l2)
+    mus, nus, cs = [], [], []
+    l1_b, l2_b = sh_l[closed[:, 0]], sh_l[closed[:, 1]]
+    for l1 in np.unique(l1_b):
+        for l2 in np.unique(l2_b):
+            sel = np.nonzero((l1_b == l1) & (l2_b == l2))[0]
+            if sel.size == 0:
+                continue
+            m1, m2 = np.meshgrid(np.arange(2 * l1 + 1), np.arange(2 * l2 + 1), indexing="ij")
+            mus.append((sh_mu0[closed[sel, 0]][:, None] + m1.ravel()[None, :]).ravel())
+            nus.append((sh_mu0[closed[sel, 1]][:, None] + m2.ravel()[None, :]).ravel())
+            cs.append(np.repeat(block_c[sel], m1.size))
+    mu_all, nu_all, c_all = np.concatenate(mus), np.concatenate(nus), np.concatenate(cs)
+    # rows by mu, within a row by (c_idx, nu); duplicates removed
+    n_orb = basis.n_orb
+    keys = np.unique((mu_all * n_c + c_all) * n_orb + nu_all)
+    src_arr = (keys // (n_c * n_orb)).astype(np.int32)
+    eci_arr = ((keys // n_orb) % n_c).astype(np.int32)
+    dst_arr = (keys % n_orb).astype(np.int32)
+    row_ptr = np.zeros(n_orb + 1, dtype=np.int32)
+    row_ptr[1:] = np.cumsum(np.bincount(src_arr, minlength=n_orb))
 
     # Transpose lookup: (nu, mu, -T)
-    trans_idx = np.empty(len(src_list), dtype=np.int32)
-    for e_i in range(len(src_list)):
-        t = cell_shifts_list[eci_arr[e_i]]
-        neg_c = shift_to_idx[(-t[0], -t[1], -t[2])]
-        trans_idx[e_i] = edge_lookup[(int(dst_arr[e_i]), int(src_arr[e_i]), neg_c)]
+    neg_c = _shift_index(-cell_shifts_np.astype(np.int64))
+    t_keys = (dst_arr.astype(np.int64) * n_c + neg_c[eci_arr]) * n_orb + src_arr
+    trans_pos = np.searchsorted(keys, t_keys)
+    if np.any(trans_pos >= keys.size) or np.any(keys[np.minimum(trans_pos, keys.size - 1)] != t_keys):
+        raise AssertionError("Symmetry-closed pattern is not closed under transposition.")
+    trans_idx = trans_pos.astype(np.int32)
 
     cell_np = np.asarray(structure.cell, dtype=np.float64)
     pos_np = np.asarray(structure.positions, dtype=np.float64)
@@ -390,7 +427,7 @@ def build_symmetry_closed_pattern(
 
     return SparsePattern(
         n_orb=basis.n_orb,
-        n_super_cells=len(cell_shifts_list),
+        n_super_cells=n_c,
         nsc=nsc,
         cell_shifts=jnp.asarray(cell_shifts_np, dtype=jnp.int32),
         src_orb=jnp.asarray(src_arr, dtype=jnp.int32),
@@ -498,7 +535,8 @@ def compile_projection_table(
         block transformation (``nspin=4, 8``).
 
     Algorithm:
-        Assembles vectorized blocks per shell pair and compacts duplicate entries via
+        Assembles the entries of all shell-pair blocks of one :math:`(l_1, l_2)` class at once per operation
+        (array operations, no loop over blocks) and compacts duplicate entries via
         sorting and ``np.add.reduceat``, and pads the rows to equal length (gather and row sum at run time).
 
     Parameters:
@@ -517,7 +555,7 @@ def compile_projection_table(
     SIESTA Mapping:
         Replaces inner edge loops in ``m_dm_symmetrize.F90`` with static sparse compilation.
     """
-    shells, lookup = _validate_sequential_shells(basis)
+    _validate_sequential_shells(basis)
     n_edges = pattern.n_edges
     if not pattern.symmetry_closed and sg.n_ops > 1:
         raise ValueError("compile_projection_table requires a symmetry_closed SparsePattern.")
@@ -533,33 +571,43 @@ def compile_projection_table(
             weights=jnp.ones((n_seg, 1), dtype=jnp.float64),
         )
 
-    src_np = np.asarray(pattern.src_orb, dtype=np.int32)
-    dst_np = np.asarray(pattern.dst_unit_orb, dtype=np.int32)
-    eci_np = np.asarray(pattern.edge_cell_idx, dtype=np.int32)
-    shifts_np = np.asarray(pattern.cell_shifts, dtype=np.int32)
-    trans_np = np.asarray(pattern.transpose_edge_idx, dtype=np.int32)
+    _, sh_atom, sh_l, sh_mu0, orb_to_sh, sh_map = _shell_arrays(basis, sg)
+    n_sh = int(sh_atom.shape[0])
+    src_np = np.asarray(pattern.src_orb, dtype=np.int64)
+    dst_np = np.asarray(pattern.dst_unit_orb, dtype=np.int64)
+    eci_np = np.asarray(pattern.edge_cell_idx, dtype=np.int64)
+    shifts_np = np.asarray(pattern.cell_shifts, dtype=np.int64)
+    trans_np = np.asarray(pattern.transpose_edge_idx, dtype=np.int64)
+    n_c = shifts_np.shape[0]
 
-    shift_to_idx = {(int(s[0]), int(s[1]), int(s[2])): i for i, s in enumerate(shifts_np)}
+    # Shell-pair blocks (sh1, sh2, c_idx): one id per block, sorted by key; per edge its block and (m1, m2) slot
+    sh1_e, sh2_e = orb_to_sh[src_np], orb_to_sh[dst_np]
+    e_key = (sh1_e * n_sh + sh2_e) * n_c + eci_np
+    blk_keys, e_blk = np.unique(e_key, return_inverse=True)
+    n_blk = blk_keys.shape[0]
+    b_sh1 = blk_keys // (n_sh * n_c)
+    b_sh2 = (blk_keys // n_c) % n_sh
+    b_c = blk_keys % n_c
+    b_l1, b_l2 = sh_l[b_sh1], sh_l[b_sh2]
+    max_d = int(2 * sh_l.max() + 1) if n_sh else 1
+    # blk_src[b, m1, m2] = edge index (-1 if missing), padded to the largest shell dimension
+    blk_src = np.full((n_blk, max_d, max_d), -1, dtype=np.int64)
+    blk_src[e_blk, src_np - sh_mu0[sh1_e], dst_np - sh_mu0[sh2_e]] = np.arange(n_edges)
+    for l1 in np.unique(b_l1):
+        for l2 in np.unique(b_l2):
+            sel = (b_l1 == l1) & (b_l2 == l2)
+            if np.any(blk_src[sel, : 2 * l1 + 1, : 2 * l2 + 1] < 0):
+                bad = int(np.nonzero(sel & np.any(blk_src[:, : 2 * l1 + 1, : 2 * l2 + 1] < 0, axis=(1, 2)))[0][0])
+                raise ValueError(
+                    f"Incomplete orbital block in sparse pattern for shells {(int(b_sh1[bad]), int(b_sh2[bad]), int(b_c[bad]))}."
+                )
 
-    orb_to_sh = np.empty(basis.n_orb, dtype=np.int32)
-    for sh_i, (_, ang_l, _, mu0) in enumerate(shells):
-        orb_to_sh[mu0 : mu0 + 2 * ang_l + 1] = sh_i
-
-    # Group edges by shell-pair block (sh1, sh2, c_idx) -> (dim1, dim2) matrix of edge indices
-    block_keys: dict[tuple[int, int, int], np.ndarray] = {}
-    for e_i in range(n_edges):
-        mu = int(src_np[e_i])
-        nu = int(dst_np[e_i])
-        c_idx = int(eci_np[e_i])
-        sh1 = int(orb_to_sh[mu])
-        sh2 = int(orb_to_sh[nu])
-        _, l1, _, mu0 = shells[sh1]
-        _, l2, _, nu0 = shells[sh2]
-        blk = block_keys.get((sh1, sh2, c_idx))
-        if blk is None:
-            blk = np.full((2 * l1 + 1, 2 * l2 + 1), -1, dtype=np.int32)
-            block_keys[(sh1, sh2, c_idx)] = blk
-        blk[mu - mu0, nu - nu0] = e_i
+    # cell-shift lookup by integer code
+    t_off = int(np.max(np.abs(shifts_np))) + 1
+    t_base = 2 * t_off + 1
+    t_codes = _encode_rows(shifts_np + t_off, t_base)
+    t_order = np.argsort(t_codes)
+    t_sorted = t_codes[t_order]
 
     # Precompute SU(2) 6x8-source real coefficients per op for nspin in (4, 8):
     # Source vector per edge e has 6 channels [0:uu_r, 1:dd_r, 2:ud_r, 3:ud_i, 4:uu_i, 5:dd_i]
@@ -606,63 +654,65 @@ def compile_projection_table(
     dst_acc: list[np.ndarray] = []
     src_acc: list[np.ndarray] = []
     w_acc: list[np.ndarray] = []
+    time_rev = np.asarray(sg.time_reversals, dtype=bool)
 
-    for (sh1, sh2, c_idx), blk_src in block_keys.items():
-        if np.any(blk_src < 0):
-            raise ValueError(f"Incomplete orbital block in sparse pattern for shells {(sh1, sh2, c_idx)}.")
-        ia1, l1, iz1, _ = shells[sh1]
-        ia2, l2, iz2, _ = shells[sh2]
-        t_vec = shifts_np[c_idx]
-        d1_all = wigner_d[l1]
-        d2_all = wigner_d[l2]
-        dim1 = 2 * l1 + 1
-        dim2 = 2 * l2 + 1
-        blk_src_t = trans_np[blk_src]  # transpose edge index for each entry in blk_src
-
-        for s in range(sg.n_ops):
-            ja1 = int(sg.atom_map[s, ia1])
-            ja2 = int(sg.atom_map[s, ia2])
-            sh1_p = lookup[(ja1, l1, iz1)]
-            sh2_p = lookup[(ja2, l2, iz2)]
-            tp = sg.rotations_frac[s] @ t_vec + sg.atom_translation[s, ia2] - sg.atom_translation[s, ia1]
-            c_idx_p = shift_to_idx.get((int(tp[0]), int(tp[1]), int(tp[2])))
-            if c_idx_p is None:
-                raise AssertionError(f"Missing rotated cell shift {tp.tolist()} in symmetry_closed pattern.")
-            blk_dst = block_keys.get((sh1_p, sh2_p, c_idx_p))
-            if blk_dst is None:
-                raise AssertionError(
-                    f"Missing rotated orbital block {(sh1_p, sh2_p, tuple(tp.tolist()))} in pattern."
-                )
-
-            # Weight tensor W[m', m, n', n] = (1/|G|) * D1[m', m] * D2[n', n]
-            w4 = inv_g * np.einsum("am,bn->abmn", d1_all[s], d2_all[s])  # (dim1, dim2, dim1, dim2)
-            # Flatten dst (a, b) -> n_pairs_dst, src (m, n) -> n_pairs_src
-            w_mat = w4.reshape(dim1 * dim2, dim1 * dim2)
-            mask = np.abs(w_mat) > 1e-13
-            ii, jj = np.where(mask)
-            if ii.size == 0:
+    for l1 in np.unique(b_l1):
+        for l2 in np.unique(b_l2):
+            cls = np.nonzero((b_l1 == l1) & (b_l2 == l2))[0]
+            if cls.size == 0:
                 continue
-            d_edges = blk_dst.ravel()[ii]
-            s_edges = blk_src.ravel()[jj]
-            s_edges_t = blk_src_t.ravel()[jj]
-            w_vals = w_mat[ii, jj]
+            dim1, dim2 = 2 * int(l1) + 1, 2 * int(l2) + 1
+            src_cls = blk_src[cls, :dim1, :dim2].reshape(cls.size, dim1 * dim2)
+            src_cls_t = trans_np[src_cls]
+            t_cls = shifts_np[b_c[cls]]
+            a1, a2 = sh_atom[b_sh1[cls]], sh_atom[b_sh2[cls]]
+            for s in range(sg.n_ops):
+                # partner blocks of the whole class under operation s
+                sh1_p, sh2_p = sh_map[s, b_sh1[cls]], sh_map[s, b_sh2[cls]]
+                tp = _image_shifts(sg, s, t_cls, a1, a2)
+                in_range = np.all(np.abs(tp) < t_off, axis=1)
+                tp_code = _encode_rows(np.where(in_range[:, None], tp, 0) + t_off, t_base)
+                pos = np.minimum(np.searchsorted(t_sorted, tp_code), n_c - 1)
+                found_t = in_range & (t_sorted[pos] == tp_code)
+                if not np.all(found_t):
+                    bad = int(np.nonzero(~found_t)[0][0])
+                    raise AssertionError(f"Missing rotated cell shift {tp[bad].tolist()} in symmetry_closed pattern.")
+                c_p = t_order[pos]
+                key_p = (sh1_p * n_sh + sh2_p) * n_c + c_p
+                bpos = np.minimum(np.searchsorted(blk_keys, key_p), n_blk - 1)
+                if not np.all(blk_keys[bpos] == key_p):
+                    bad = int(np.nonzero(blk_keys[bpos] != key_p)[0][0])
+                    raise AssertionError(
+                        f"Missing rotated orbital block {(int(sh1_p[bad]), int(sh2_p[bad]), tuple(tp[bad].tolist()))} in pattern."
+                    )
+                dst_cls = blk_src[bpos, :dim1, :dim2].reshape(cls.size, dim1 * dim2)
 
-            if nspin == 1:
-                dst_acc.append(d_edges)
-                src_acc.append(s_edges)
-                w_acc.append(w_vals)
-            elif nspin == 2:
-                tr = bool(sg.time_reversals[s])
-                for ch_s in (0, 1):
-                    ch_d = (1 - ch_s) if tr else ch_s
-                    dst_acc.append(ch_d * n_edges + d_edges)
-                    src_acc.append(ch_s * n_edges + s_edges)
+                # Weight tensor W[m', m, n', n] = (1/|G|) * D1[m', m] * D2[n', n], flattened dst (a, b) x src (m, n)
+                w4 = inv_g * np.einsum("am,bn->abmn", wigner_d[int(l1)][s], wigner_d[int(l2)][s])
+                w_mat = w4.reshape(dim1 * dim2, dim1 * dim2)
+                ii, jj = np.nonzero(np.abs(w_mat) > 1e-13)
+                if ii.size == 0:
+                    continue
+                d_edges = dst_cls[:, ii].ravel()
+                s_edges = src_cls[:, jj].ravel()
+                w_vals = np.broadcast_to(w_mat[ii, jj], (cls.size, ii.size)).ravel()
+
+                if nspin == 1:
+                    dst_acc.append(d_edges)
+                    src_acc.append(s_edges)
                     w_acc.append(w_vals)
-            else:
-                for ch_d, ch_s, use_t, sp_w in spin_rules[s]:
-                    dst_acc.append(ch_d * n_edges + d_edges)
-                    src_acc.append(ch_s * n_edges + (s_edges_t if use_t else s_edges))
-                    w_acc.append(sp_w * w_vals)
+                elif nspin == 2:
+                    for ch_s in (0, 1):
+                        ch_d = (1 - ch_s) if time_rev[s] else ch_s
+                        dst_acc.append(ch_d * n_edges + d_edges)
+                        src_acc.append(ch_s * n_edges + s_edges)
+                        w_acc.append(w_vals)
+                else:
+                    s_edges_t = src_cls_t[:, jj].ravel()
+                    for ch_d, ch_s, use_t, sp_w in spin_rules[s]:
+                        dst_acc.append(ch_d * n_edges + d_edges)
+                        src_acc.append(ch_s * n_edges + (s_edges_t if use_t else s_edges))
+                        w_acc.append(sp_w * w_vals)
 
     n_ch = 1 if nspin == 1 else (2 if nspin == 2 else 6)
     n_seg = n_ch * n_edges

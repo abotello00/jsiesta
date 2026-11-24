@@ -32,8 +32,10 @@ Theory:
        in SIESTA) so :math:`R_{z\zeta}(r) = 0` smoothly for :math:`r \ge r_m`.
 
     3. **Polarization Shells:** Supports both SIESTA perturbative electric-field linear
-       response :math:`(H_{l+1} + V_{\text{conf}} - \varepsilon_{nl}) u_{\text{pol}} = -r u_{nl}`
-       and explicit soft-confined :math:`(n, l+1)` shells.
+       response :math:`(H_{l+1} + V_{\text{conf}} - \varepsilon_{nl}) u_{\text{pol}} = -r u_{nl} / (dr/di)^{3/2}` on
+       SIESTA's logarithmic grid (the source term SIESTA's ``polarization`` routine effectively uses), with the cut-off
+       of the parent's first zeta and the parent's soft confinement (SIESTA ``POLgen``, the ``P`` flag of
+       ``PAO.Basis``), and explicit soft-confined :math:`(n, l+1)` shells.
 
     4. **Semilocal PSML Support:** When a PSML contains ``<semilocal-potentials>`` without
        pre-split ``<local-potential>`` / ``<nonlocal-projectors>``, builds smooth
@@ -1067,17 +1069,36 @@ def generate_species_from_psml(
             candidates = [k for k in first_zeta_by_l if k[1] == par_l]
             par_key = candidates[-1]
         eps_par, rc_par, rad_par = first_zeta_by_l[par_key]
-        rc_1_pol = float(sh.rc_list[0]) if (sh.rc_list and len(sh.rc_list) > 0) else rc_par
-        nrc_p = max(int(np.argmin(np.abs(r - rc_1_pol))), 5)
+        # SIESTA convention (atom.F, POLgen; PAO.Basis "P" flag): the polarisation orbital takes the cut-off of the
+        # parent's first zeta and the parent's soft confinement; it has no cut-off or confinement of its own.
+        par_spec = next((v for v in valence_specs if (v.n, v.l) == par_key), None)
+        par_v0 = par_spec.v0_ha if par_spec is not None else 0.0
+        par_ri = par_spec.ri_bohr if par_spec is not None else 0.0
+        if sh.rc_list and abs(float(sh.rc_list[0]) - rc_par) > 0.05:
+            raise ValueError(
+                f"Perturbative polarisation shell n={sh.n} l={sh.l}: rc {sh.rc_list[0]} differs from the parent's first "
+                f"zeta ({rc_par:.4f} Bohr); it takes the parent's cut-off (SIESTA 'P'). Use polarization_mode="
+                "'eigenstate' for an independent cut-off."
+            )
+        if (sh.v0_ha, sh.ri_bohr) != (0.0, 0.0) and (sh.v0_ha, sh.ri_bohr) != (par_v0, par_ri):
+            raise ValueError(
+                f"Perturbative polarisation shell n={sh.n} l={sh.l}: soft confinement ({sh.v0_ha}, {sh.ri_bohr}) differs "
+                f"from the parent's ({par_v0}, {par_ri}); it takes the parent's (SIESTA 'P')."
+            )
+        nrc_p = max(int(np.argmin(np.abs(r - rc_par))), 5)
         rc_1_eff = float(r[nrc_p])
 
         vp_pol, kbl_pol = _channel_pot(sh.l)
-        v_soft_pol = _build_vsoft(r, sh.ri_bohr, rc_1_eff, sh.v0_ha)
+        v_soft_pol = _build_vsoft(r, par_ri, rc_1_eff, par_v0)
         diag_p, off_p = _radial_tridiag(
             r, drdi, a, sh.l, vp_pol + v_scr + v_soft_pol, nrc_p
         )
         m = nrc_p - 1
-        rhs = -r[1:nrc_p] * (r[1:nrc_p] * rad_par[1:nrc_p] * np.sqrt(drdi[1:nrc_p]))
+        # Source term as in SIESTA's `polarization` (atom.F): its Numerov recursion for g = u / sqrt(dr/di) on the
+        # logarithmic grid takes -r u_parent as the source of g, which in r is r u_parent / (dr/di)^(3/2), not the
+        # textbook r u_parent. In the symmetric form used here (psi = sqrt(dr/di) u) that is -r u_parent / (dr/di).
+        # With the textbook source the polarisation orbital overlaps SIESTA's by only 0.95-0.98 (D-050).
+        rhs = -r[1:nrc_p] * (r[1:nrc_p] * rad_par[1:nrc_p]) / drdi[1:nrc_p]
         has_kb_p = bool(kbl_pol and any(ekb != 0.0 for _, ekb in kbl_pol))
         if not has_kb_p:
             ab = np.zeros((3, m), dtype=np.float64)
@@ -1110,8 +1131,8 @@ def generate_species_from_psml(
                 "l": sh.l,
                 "zeta": 1,
                 "rc_bohr": rc_1_eff,
-                "v0_ha": sh.v0_ha,
-                "ri_bohr": sh.ri_bohr,
+                "v0_ha": par_v0,
+                "ri_bohr": par_ri,
                 "polarization": True,
                 "polarization_mode": "perturbative",
             }
