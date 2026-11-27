@@ -801,6 +801,8 @@ def _engine_for_basis(
 ) -> tuple[NativeSymmetryEngine, SparsePattern]:
     """Symmetry-closed pattern, Wigner-D matrices and projection table of ``basis`` (see ``build_native_symmetry``)."""
     sg = setup.sg
+    if base_pattern is None:
+        base_pattern = build_sparse_pattern(structure, basis, orbital_range_scale=config.hfx_pattern_scale)
     pattern = build_symmetry_closed_pattern(structure, basis, sg, base=base_pattern)
 
     l_max = _basis_l_max(basis)
@@ -910,7 +912,7 @@ class NativeSymmetrySetupCache:
         SIESTA Mapping:
             No SIESTA equivalent (see the class).
         """
-        base = build_sparse_pattern(self.structure, basis)
+        base = build_sparse_pattern(self.structure, basis, orbital_range_scale=self.config.hfx_pattern_scale)
         layout = _orbital_layout(basis)
         for i, entry in enumerate(self._entries):
             if entry[0] == layout and same_edges(entry[1], base):

@@ -18,12 +18,22 @@ SIESTA Mapping:
 """
 
 from jax_siesta.xc.dispersion import DFTD3Dispersion, RVV10Dispersion
-from jax_siesta.xc.functional import LibxcFFIEvaluator, resolve_xc_id, xc_energy_from_grid
+from jax_siesta.xc.functional import (
+    ExactExchangeSpec,
+    LibxcFFIEvaluator,
+    exact_exchange_spec,
+    libxc_version,
+    resolve_xc_id,
+    xc_energy_from_grid,
+)
 
 __all__ = [
     "DFTD3Dispersion",
+    "ExactExchangeSpec",
     "LibxcFFIEvaluator",
     "RVV10Dispersion",
+    "exact_exchange_spec",
+    "libxc_version",
     "resolve_xc_id",
     "xc_energy_from_grid",
 ]

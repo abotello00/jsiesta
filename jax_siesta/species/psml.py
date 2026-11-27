@@ -835,6 +835,7 @@ def build_sparse_pattern(
     basis: BasisData,
     extra_edges: list[tuple[int, int, tuple[int, int, int]]] | None = None,
     symmetry_closed: bool = False,
+    orbital_range_scale: float = 1.0,
 ) -> SparsePattern:
     r"""Build the interacting static CSR/COO orbital-pair ``SparsePattern``.
 
@@ -844,6 +845,9 @@ def build_sparse_pattern(
         lies within :math:`r_c(\mu) + r_c(\nu)` OR that share an indirect Kleinman-Bylander
         projector bridge :math:`(\mu \leftrightarrow \chi_k \leftrightarrow \nu)`.
         Includes explicit transpose edges :math:`(\nu, \mu, -\mathbf{T})` for exact Hermiticity.
+        With ``orbital_range_scale`` above one, pairs out to that multiple of the sum of the radii are included
+        as well. Their overlap and semilocal Hamiltonian elements vanish; they carry the density matrix and the
+        exchange matrix of a hybrid functional, which do not vanish there.
 
     Algorithm:
         Determines supercell bounding box ``nsc`` from max orbital + KB cutoffs and
@@ -861,6 +865,7 @@ def build_sparse_pattern(
         extra_edges: Optional extra ``(src_orb, dst_unit_orb, (sx, sy, sz))`` edges
             for symmetry closure.
         symmetry_closed: Whether the returned pattern is certified symmetry-closed.
+        orbital_range_scale: Factor on the sum of the orbital radii in the pair criterion (at least one).
 
     Returns:
         Immutable ``SparsePattern`` PyTree.
@@ -881,7 +886,10 @@ def build_sparse_pattern(
     rc_kb = np.asarray(basis.kb_rcut, dtype=np.float64)
     max_rc_orb = float(np.max(rc_orb)) if len(rc_orb) else 0.0
     max_rc_kb = float(np.max(rc_kb)) if len(rc_kb) else 0.0
-    max_interaction_r = 2.0 * max_rc_orb + 2.0 * max_rc_kb
+    scale = float(orbital_range_scale)
+    if scale < 1.0:
+        raise ValueError("orbital_range_scale must be at least one.")
+    max_interaction_r = max(2.0 * max_rc_orb + 2.0 * max_rc_kb, scale * 2.0 * max_rc_orb)
 
     inv_cell = np.linalg.inv(cell)
     # Bounding supercell half-widths along each lattice vector
@@ -954,12 +962,12 @@ def build_sparse_pattern(
         mu_loc = np.arange(mu_lo, mu_lo + n_mu, dtype=np.int64)
         # Direct orbital-orbital overlaps: atom-level test, then per orbital pair
         d_row = dist_rows[ia]
-        ja, si = np.nonzero(d_row <= (atom_max_orb[ia] + atom_max_orb)[:, None] + 1e-9)
+        ja, si = np.nonzero(d_row <= scale * (atom_max_orb[ia] + atom_max_orb)[:, None] + 1e-9)
         if ja.size:
             grp, nu = _expand_ranges(offs[ja], n_orb_atom[ja])
             dist = d_row[ja[grp], si[grp]]
             mu_b = np.repeat(mu_loc[None, :], nu.size, axis=0)
-            keep = dist[:, None] <= (rc_orb[mu_b] + rc_orb[nu][:, None]) + 1e-9
+            keep = dist[:, None] <= scale * (rc_orb[mu_b] + rc_orb[nu][:, None]) + 1e-9
             pr, pc = np.nonzero(keep)
             edge_mu.append(mu_loc[pc])
             edge_nu.append(nu[pr])

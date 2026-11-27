@@ -27,6 +27,7 @@ SIESTA Mapping:
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -69,11 +70,54 @@ _MGGA_LIBXC_PAIRS: dict[int, tuple[int, int]] = {
 }
 
 
-_LIBXC_FAMILY_MGGA = 4  # XC_FAMILY_MGGA in Libxc >= 5 (LDA = 1, GGA = 2, HYB_* folded into flags)
+_LIBXC_FAMILY_MGGA = 4  # semilocal XC_FAMILY_MGGA (LDA = 1, GGA = 2); hybrids are reported by their semilocal family
+
+# Named hybrids -> Libxc id of the complete functional (semilocal part plus exact-exchange parameters).
+_HYBRID_LIBXC_IDS: dict[str, int] = {
+    "HSE06": 428,
+    "PBE0": 406,
+    "PBEH": 406,
+    "B3LYP": 402,
+}
+
+
+@dataclass(frozen=True)
+class ExactExchangeSpec:
+    r"""Exact-exchange part of an exchange-correlation functional.
+
+    Theory:
+        A hybrid is :math:`E_{xc} = E^{sl}_{xc} + \alpha E_x^{HF}[1/r] + \beta E_x^{HF}[\mathrm{erfc}(\omega r)/r]`
+        with :math:`E^{sl}_{xc}` the semilocal remainder that Libxc evaluates for the hybrid id. This is the
+        Libxc convention, in which :math:`\alpha` is the fraction of exact exchange at long range and
+        :math:`\alpha + \beta` the fraction at short range.
+
+    Algorithm:
+        Plain record; built by ``exact_exchange_spec``.
+
+    Parameters:
+        alpha: Fraction of full-range exact exchange.
+        beta: Fraction of short-range exact exchange.
+        omega: Range-separation parameter in Bohr^-1.
+
+    Invariants:
+        ``is_hybrid`` is false exactly when ``alpha`` and ``beta`` are both zero.
+
+    SIESTA Mapping:
+        None in SIESTA. HONPAS hard-codes HSE06 (``beta = 0.25``, ``omega = 0.11``).
+    """
+
+    alpha: float = 0.0
+    beta: float = 0.0
+    omega: float = 0.0
+
+    @property
+    def is_hybrid(self) -> bool:
+        """True when the functional contains exact exchange."""
+        return self.alpha != 0.0 or self.beta != 0.0
 
 
 def _libxc_ids_need_tau(ids: tuple[int, int], name: str) -> bool:
-    """Classify Libxc ids via the FFI; reject hybrids and VV10 functionals jsiesta cannot evaluate (review L3)."""
+    """Classify Libxc ids via the FFI (semilocal family); reject VV10 functionals, which belong to ``dispersion``."""
     from jax_siesta.core.ffi import load_ffi_library
 
     lib = load_ffi_library()
@@ -90,12 +134,107 @@ def _libxc_ids_need_tau(ids: tuple[int, int], name: str) -> bool:
             raise RuntimeError(f"{name!r} needs Libxc, but libjsiesta_ffi was built without it.")
         if rc != 0:
             raise ValueError(f"Unknown Libxc functional id {fid} in {name!r}.")
-        if hyb.value:
-            raise ValueError(f"Libxc id {fid} in {name!r} is a hybrid; exact exchange is not implemented.")
         if vv10.value:
             raise ValueError(f"Libxc id {fid} in {name!r} contains VV10; use dispersion='RVV10' instead.")
         is_mgga = is_mgga or fam.value == _LIBXC_FAMILY_MGGA
     return is_mgga
+
+
+def _libxc_spec_ids(name: str) -> tuple[int, int] | None:
+    """Libxc ids of a functional name that is evaluated through Libxc ids, else ``None`` (built-in names)."""
+    key = name.strip().upper().replace("-", "_")
+    if key in _HYBRID_LIBXC_IDS:
+        return _HYBRID_LIBXC_IDS[key], 0
+    if key.startswith("LIBXC_"):
+        parts = [int(p) for p in key[len("LIBXC_") :].split("+") if p]
+        if len(parts) not in (1, 2):
+            raise ValueError(f"Malformed Libxc spec {name!r}; expected 'LIBXC-<x>' or 'LIBXC-<x>+<c>'.")
+        return parts[0], parts[1] if len(parts) == 2 else 0
+    return None
+
+
+def exact_exchange_spec(name: str) -> ExactExchangeSpec:
+    r"""Exact-exchange parameters ``(alpha, beta, omega)`` of a functional name.
+
+    Theory:
+        See ``ExactExchangeSpec``. PBE0 gives ``alpha = 0.25``; HSE06 gives ``beta = 0.25`` and
+        ``omega = 0.11`` Bohr^-1; a semilocal functional gives zeros.
+
+    Algorithm:
+        Built-in names have no exact exchange. For ``HSE06``, ``PBE0``, ``B3LYP`` and ``LIBXC-<ids>`` the
+        parameters are read from Libxc (``jsiesta_libxc_hybrid_coef``) and summed over the ids.
+
+    Parameters:
+        name: Functional name, as accepted by ``resolve_xc_spec``.
+
+    Returns:
+        The exact-exchange parameters of the functional.
+
+    Invariants:
+        Raises ``ValueError`` for a hybrid with a Yukawa kernel and for an unknown id. Independent of the
+        Libxc version (5.1 to 7.x).
+
+    SIESTA Mapping:
+        None in SIESTA; HONPAS reads ``XC.functional HSE06``.
+    """
+    ids = _libxc_spec_ids(name)
+    if ids is None:
+        resolve_xc_spec(name)  # validates the name
+        return ExactExchangeSpec()
+    from jax_siesta.core.ffi import load_ffi_library
+
+    lib = load_ffi_library()
+    query = getattr(lib, "jsiesta_libxc_hybrid_coef", None)
+    if query is None:
+        raise RuntimeError("libjsiesta_ffi is too old for hybrid functionals; rebuild it (make ffi).")
+    alpha = beta = omega = 0.0
+    for fid in ids:
+        if fid <= 0:
+            continue
+        a, b, w = ctypes.c_double(0.0), ctypes.c_double(0.0), ctypes.c_double(0.0)
+        rc = query(ctypes.c_int32(fid), ctypes.byref(a), ctypes.byref(b), ctypes.byref(w))
+        if rc == 1:
+            raise RuntimeError(f"{name!r} needs Libxc, but libjsiesta_ffi was built without it.")
+        if rc == 2:
+            raise ValueError(f"Unknown Libxc functional id {fid} in {name!r}.")
+        if rc == 3:
+            raise ValueError(f"Libxc id {fid} in {name!r} is a Yukawa-screened hybrid, which is not supported.")
+        if b.value != 0.0 and beta != 0.0 and w.value != omega:
+            raise ValueError(f"{name!r} combines two range-separation parameters.")
+        alpha += a.value
+        beta += b.value
+        omega = w.value if b.value != 0.0 else omega
+    return ExactExchangeSpec(alpha=alpha, beta=beta, omega=omega)
+
+
+def libxc_version() -> tuple[int, int, int] | None:
+    """Version ``(major, minor, micro)`` of the Libxc library the kernels are linked against, or ``None``.
+
+    Theory:
+        Functional ids, default parameters and low-density numerics differ between Libxc releases, so results
+        are reported with the version that produced them.
+
+    Algorithm:
+        Calls ``jsiesta_libxc_version`` (``xc_version``).
+
+    Returns:
+        ``(major, minor, micro)``, or ``None`` when the library was built without Libxc.
+
+    Invariants:
+        Supported releases are 5.1 to 7.x; the tests run against 6.2.2, 7.0.0 and 7.1.2.
+
+    SIESTA Mapping:
+        The Libxc version line of SIESTA's output header.
+    """
+    from jax_siesta.core.ffi import load_ffi_library
+
+    query = getattr(load_ffi_library(), "jsiesta_libxc_version", None)
+    if query is None:
+        return None
+    a, b, c = ctypes.c_int32(0), ctypes.c_int32(0), ctypes.c_int32(0)
+    if query(ctypes.byref(a), ctypes.byref(b), ctypes.byref(c)) != 0:
+        return None
+    return a.value, b.value, c.value
 
 
 def resolve_xc_spec(name: str) -> tuple[bool, int, tuple[int, int]]:
@@ -106,8 +245,9 @@ def resolve_xc_spec(name: str) -> tuple[bool, int, tuple[int, int]]:
         built-in kernel IDs or explicit Libxc functional ID pairs.
 
     Algorithm:
-        Checks named functional tables (``XC_IDS``, ``_MGGA_LIBXC_PAIRS``) and parses
-        explicit ``LIBXC-<x>+<c>`` or ``LIBXC-<id>`` syntax.
+        Checks named functional tables (``XC_IDS``, ``_MGGA_LIBXC_PAIRS``, the named hybrids) and parses
+        explicit ``LIBXC-<x>+<c>`` or ``LIBXC-<id>`` syntax. For a hybrid the ids describe the semilocal
+        remainder; ``exact_exchange_spec`` gives the exact-exchange part.
 
     Parameters:
         name: Functional name string (e.g., ``"PBE"``, ``"R2SCAN01"``, ``"LIBXC-645+642"``).
@@ -127,18 +267,18 @@ def resolve_xc_spec(name: str) -> tuple[bool, int, tuple[int, int]]:
         if xc_id in _MGGA_LIBXC_PAIRS:
             return True, xc_id, _MGGA_LIBXC_PAIRS[xc_id]
         return False, xc_id, (0, 0)
-    if key.startswith("LIBXC_"):
-        spec = key[len("LIBXC_") :]
-        parts = [int(p) for p in spec.split("+") if p]
-        if len(parts) not in (1, 2):
-            raise ValueError(f"Malformed Libxc spec {name!r}; expected 'LIBXC-<x>' or 'LIBXC-<x>+<c>'.")
-        ids = (parts[0], parts[1] if len(parts) == 2 else 0)
-        # Validates the ids and rejects hybrids / VV10 (which would otherwise run silently without exact
-        # exchange or non-local correlation). All Libxc specs use the meta-GGA evaluation route, whose C++
-        # kernel dispatches LDA/GGA/MGGA by family; tau is simply unused for non-meta-GGA ids.
+    ids = _libxc_spec_ids(name)
+    if ids is not None:
+        # Validates the ids and rejects VV10 (which would otherwise run silently without non-local correlation).
+        # All Libxc specs use the meta-GGA evaluation route, whose C++ kernel dispatches LDA/GGA/MGGA by the
+        # semilocal family; tau is simply unused for non-meta-GGA ids. For a hybrid this is the semilocal
+        # remainder only: the exact exchange is described by ``exact_exchange_spec`` and added by the SCF.
         _libxc_ids_need_tau(ids, name)
         return True, 20, ids
-    raise ValueError(f"Unsupported XC functional {name!r}; supported: {sorted(XC_IDS)} or 'LIBXC-<x>+<c>'")
+    raise ValueError(
+        f"Unsupported XC functional {name!r}; supported: {sorted(XC_IDS)}, {sorted(_HYBRID_LIBXC_IDS)} "
+        "or 'LIBXC-<x>+<c>'"
+    )
 
 
 def resolve_xc_id(name: str) -> int:

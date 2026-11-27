@@ -26,6 +26,12 @@ flowchart LR
     core --> grid
     grid.mesh["jax_siesta.grid.mesh"]
     core --> grid.mesh
+    hfx["jax_siesta.hfx"]
+    core --> hfx
+    hfx.exchange["jax_siesta.hfx.exchange"]
+    core --> hfx.exchange
+    hfx.nao2gto["jax_siesta.hfx.nao2gto"]
+    core --> hfx.nao2gto
     integrals["jax_siesta.integrals"]
     core --> integrals
     integrals.two_center["jax_siesta.integrals.two_center"]

@@ -53,7 +53,7 @@ external optimisers), PSML pseudopotentials only.
 | Area | Capability |
 |---|---|
 | Spin | `nspin` 1, 2, 4 (non-collinear) and 8 (spin–orbit) |
-| Exchange–correlation | LDA, GGA and meta-GGA (r2SCAN) through Libxc; DFT-D3(BJ) and rVV10 dispersion |
+| Exchange–correlation | LDA, GGA and meta-GGA (r2SCAN) through Libxc; hybrid functionals (HSE06, PBE0, B3LYP) for all spin modes, with forces and stress; DFT-D3(BJ) and rVV10 dispersion |
 | Symmetry | spglib space and magnetic groups, irreducible k-points, symmetrised density and energy-density matrices, symmetry-commensurate mesh |
 | SCF | Tikhonov–Pulay, Broyden and ADIIS mixers, adaptive trust-region controller, mandatory post-SCF `DM_out` evaluation, Harris energy |
 | Observables | Forces and stress at fixed (D, E) by automatic differentiation of the discrete energy, Mulliken moments |
@@ -74,6 +74,7 @@ jax_siesta/          Python/JAX package
   integrals/         two-centre integrals (S, T, V_KB, V_NA) and their derivatives
   grid/              mesh selection, FFT Poisson, orbital-grid FFI wrappers
   xc/                Libxc evaluation, DFT-D3, rVV10
+  hfx/               exact exchange of hybrid functionals (Gaussian fits, four-centre integrals)
   symmetry/          spglib wrapper, Wigner-D, density-matrix projection, grid symmetrisation
   scf/               eigensolver, mixers, adaptive controller, SCF driver
   observables/       post-SCF pass, energies, forces and stress

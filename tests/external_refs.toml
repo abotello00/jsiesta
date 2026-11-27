@@ -24,3 +24,5 @@ pseudodojo_fr_pbe_dir = ""
 co_pilot_dir = ""
 # SQLite documentation index of a SIESTA source tree (docs.db from rebuild_index.py; links code to SIESTA routines).
 siesta_doc_index = ""
+# HONPAS executable (hybrid functionals, HSE06): reference for tests/test_hfx_scf.py.
+honpas_bin = ""

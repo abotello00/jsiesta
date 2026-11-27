@@ -74,6 +74,10 @@ typing-inspection==0.4.5
 tzdata==2026.6
 urllib3==2.8.0
 uvicorn==0.45.0
+# Reference for the four-centre integrals of the hybrid functionals (tests/test_eri.py, tests/test_hfx.py)
+h5py==3.16.0
+pyscf==2.15.1
+setuptools==84.2.1
 # Documentation notebooks and tutorials (myst-nb renders them, jupytext + nbclient execute them, matplotlib plots)
 ast-serialize==0.13.1
 asttokens==3.0.2

@@ -24,6 +24,7 @@
  */
 
 #include "jsiesta/grid_xc_ffi.hpp"
+#include "jsiesta/libxc_compat.hpp"
 #include "jsiesta/threading.hpp"
 #include "jsiesta/xc_semilocal.hpp"
 #include "xla/ffi/api/ffi.h"
@@ -155,6 +156,21 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::DataType::F64>>()   // v_sigma (3, n_grid)
         .Ret<ffi::Buffer<ffi::DataType::F64>>()); // v_tau (2, n_grid)
 
+/**
+ * Cross term of the spin-resolved gradient with a floor on the total gradient.
+ *
+ * Libxc 7.1 returns NaN for the derivatives of PBE-type correlation when
+ * \f$\sigma_{\uparrow\uparrow} + 2\sigma_{\uparrow\downarrow} + \sigma_{\downarrow\downarrow}\f$ is exactly zero
+ * while the spin gradients are not (opposite spin gradients, as at an extremum of the total density). The total is
+ * kept at or above \f$10^{-12}(\sigma_{\uparrow\uparrow} + \sigma_{\downarrow\downarrow})\f$, which changes the
+ * energy density by less than its rounding error and leaves every other point untouched.
+ */
+[[maybe_unused]] inline double guarded_sigma_ud(double s_uu, double s_ud, double s_dd) {
+    const double scale = s_uu + s_dd;
+    const double floor_tot = 1e-12 * scale;
+    return (scale + 2.0 * s_ud < floor_tot) ? 0.5 * (floor_tot - scale) : s_ud;
+}
+
 [[maybe_unused]] int evaluate_xc_libxc_range(
     int64_t n_grid,
     int64_t stride,
@@ -191,8 +207,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
             r_lib[2 * p] = std::max(0.0, r_ptr[p]);
             r_lib[2 * p + 1] = std::max(0.0, r_ptr[stride + p]);
             s_lib[3 * p] = std::max(0.0, s_ptr[p]);
-            s_lib[3 * p + 1] = s_ptr[stride + p];
             s_lib[3 * p + 2] = std::max(0.0, s_ptr[2 * stride + p]);
+            s_lib[3 * p + 1] = guarded_sigma_ud(s_lib[3 * p], s_ptr[stride + p], s_lib[3 * p + 2]);
         }
     }
 
@@ -315,8 +331,8 @@ int evaluate_mgga_libxc_range(
             r_lib[2 * p] = std::max(0.0, r_ptr[p]);
             r_lib[2 * p + 1] = std::max(0.0, r_ptr[stride + p]);
             s_lib[3 * p] = std::max(0.0, s_ptr[p]);
-            s_lib[3 * p + 1] = s_ptr[stride + p];
             s_lib[3 * p + 2] = std::max(0.0, s_ptr[2 * stride + p]);
+            s_lib[3 * p + 1] = guarded_sigma_ud(s_lib[3 * p], s_ptr[stride + p], s_lib[3 * p + 2]);
             t_lib[2 * p] = std::max(0.0, t_ptr[p]);
             t_lib[2 * p + 1] = std::max(0.0, t_ptr[stride + p]);
         }
@@ -341,7 +357,8 @@ int evaluate_mgga_libxc_range(
             return 2;
         }
         xc_func_set_dens_threshold(&func, 1e-10);
-        const int fam = xc_func_info_get_family(func.info);
+        // Hybrids are evaluated through the kernel of their semilocal family (their exact exchange is added elsewhere).
+        const int fam = jsiesta::libxc_semilocal_family(xc_func_info_get_family(func.info));
         std::fill(e_tmp.begin(), e_tmp.end(), 0.0);
         std::fill(vr_tmp.begin(), vr_tmp.end(), 0.0);
         std::fill(vs_tmp.begin(), vs_tmp.end(), 0.0);

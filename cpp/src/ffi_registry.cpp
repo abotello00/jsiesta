@@ -18,6 +18,7 @@
  */
 
 #include "jsiesta/ffi_kernels.hpp"
+#include "jsiesta/libxc_compat.hpp"
 
 #ifdef JSIESTA_HAS_LIBXC
 #include <xc.h>
@@ -71,14 +72,9 @@ int32_t jsiesta_libxc_info(int32_t id, int32_t* family, int32_t* is_hybrid, int3
     if (xc_func_init(&func, static_cast<int>(id), XC_UNPOLARIZED) != 0) {
         return 2;
     }
-    *family = static_cast<int32_t>(xc_func_info_get_family(func.info));
-#if defined(XC_MAJOR_VERSION) && XC_MAJOR_VERSION >= 7
-    *is_hybrid = (xc_hyb_type(&func) != XC_HYB_NONE) ? 1 : 0;
-#else
-    // Libxc 5/6 mark hybrids by family; Libxc 7 replaced the hybrid families by xc_hyb_type().
     const int fam = xc_func_info_get_family(func.info);
-    *is_hybrid = (fam == XC_FAMILY_HYB_GGA || fam == XC_FAMILY_HYB_MGGA) ? 1 : 0;
-#endif
+    *family = static_cast<int32_t>(jsiesta::libxc_semilocal_family(fam));
+    *is_hybrid = jsiesta::libxc_is_hybrid(&func) ? 1 : 0;
     *is_vv10 = (xc_func_info_get_flags(func.info) & XC_FLAGS_VV10) ? 1 : 0;
     xc_func_end(&func);
     return 0;
@@ -87,6 +83,53 @@ int32_t jsiesta_libxc_info(int32_t id, int32_t* family, int32_t* is_hybrid, int3
     (void)family;
     (void)is_hybrid;
     (void)is_vv10;
+    return 1;
+#endif
+}
+
+int32_t jsiesta_libxc_version(int32_t* major, int32_t* minor, int32_t* micro) {
+#ifdef JSIESTA_HAS_LIBXC
+    int a = 0, b = 0, c = 0;
+    xc_version(&a, &b, &c);
+    *major = a;
+    *minor = b;
+    *micro = c;
+    return 0;
+#else
+    (void)major;
+    (void)minor;
+    (void)micro;
+    return 1;
+#endif
+}
+
+int32_t jsiesta_libxc_hybrid_coef(int32_t id, double* alpha, double* beta, double* omega) {
+#ifdef JSIESTA_HAS_LIBXC
+    xc_func_type func;
+    if (xc_func_init(&func, static_cast<int>(id), XC_UNPOLARIZED) != 0) {
+        return 2;
+    }
+    *alpha = 0.0;
+    *beta = 0.0;
+    *omega = 0.0;
+    int rc = 0;
+    if (jsiesta::libxc_is_hybrid(&func)) {
+        const int flags = xc_func_info_get_flags(func.info);
+        if (flags & XC_FLAGS_HYB_CAMY) {
+            rc = 3;  // Yukawa range separation: no integral kernel for it
+        } else if (flags & XC_FLAGS_HYB_CAM) {
+            xc_hyb_cam_coef(&func, omega, alpha, beta);
+        } else {
+            *alpha = xc_hyb_exx_coef(&func);
+        }
+    }
+    xc_func_end(&func);
+    return rc;
+#else
+    (void)id;
+    (void)alpha;
+    (void)beta;
+    (void)omega;
     return 1;
 #endif
 }

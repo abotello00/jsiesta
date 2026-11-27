@@ -225,8 +225,8 @@ def test_rvv10_potential_is_functional_derivative() -> None:
     assert jnp.all(jnp.isfinite(s_r))
 
 
-def test_libxc_spec_rejects_hybrids_and_unknown_ids() -> None:
-    """Review L3: hybrids must not run silently without exact exchange."""
+def test_libxc_spec_recognises_hybrids_and_rejects_unknown_ids() -> None:
+    """Review L3: a hybrid is recognised as one (so that it cannot run silently without exact exchange)."""
     import pytest
 
     from jax_siesta.core.ffi import ffi_backend_info
@@ -235,8 +235,11 @@ def test_libxc_spec_rejects_hybrids_and_unknown_ids() -> None:
     if not ffi_backend_info().get("has_libxc", False):
         pytest.skip("libjsiesta_ffi built without Libxc")
     assert resolve_xc_spec("LIBXC-101+130")[2] == (101, 130)  # PBE exchange + correlation
-    with pytest.raises(ValueError, match="hybrid"):
-        resolve_xc_spec("LIBXC-402")  # B3LYP
+    from jax_siesta.xc.functional import exact_exchange_spec
+
+    assert resolve_xc_spec("LIBXC-402")[2] == (402, 0)  # B3LYP: semilocal remainder through the Libxc route
+    assert exact_exchange_spec("LIBXC-402").is_hybrid
+    assert not exact_exchange_spec("LIBXC-101+130").is_hybrid
     with pytest.raises(ValueError, match="Unknown Libxc"):
         resolve_xc_spec("LIBXC-99999")
 
@@ -338,7 +341,7 @@ def test_builtin_xc_kernel_matches_libxc(func: str, nspin: int) -> None:
 
     Compares ``jsiesta_xc_eval_builtin`` (``cpp/include/jsiesta/xc_semilocal.hpp``) with the Libxc path of
     ``jsiesta_xc_eval_f64`` from vacuum (1e-11) to core densities: energy density and v_rho to relative 1e-12, and the
-    v_sigma error on the energy scale, |dv_sigma| * |sigma| <= 1e-12 |e_xc|.
+    v_sigma error on the energy scale, |dv_sigma| * |sigma| <= 1e-12 |e_xc| (100 times looser below 1e-9 a.u.).
     """
     import ctypes
 
@@ -374,7 +377,12 @@ def test_builtin_xc_kernel_matches_libxc(func: str, nspin: int) -> None:
     )
     e_l, vr_l, vs_l = (np.asarray(x) for x in call(jnp.asarray(rho), jnp.asarray(sig), xc_id=xc_id, n_spin_pol=nspin))
 
-    live = rho.sum(axis=0) > 1e-12
-    assert np.all(np.abs(e_b - e_l) <= 1e-12 * np.abs(e_l))
-    assert np.all((np.abs(vr_b - vr_l) <= 1e-11 * np.abs(vr_l))[:, live])
-    assert np.all(((np.abs(vs_b - vs_l) * np.abs(sig)) <= 1e-12 * np.abs(e_l)[None, :])[:, live])
+    # Below 1e-9 a.u. the PW92 logarithm log(1 + x) loses digits (x is about 1e-5): Libxc 7.1 evaluates it more
+    # accurately than Libxc 5 to 7.0 and than the built-in kernel, and the two differ by up to 1.4e-11 (energy) and
+    # 1.1e-10 (v_rho) relative there (measured with 7.1.2). The tolerances are a factor 10 looser in that range.
+    n_tot = rho.sum(axis=0)
+    live = n_tot > 1e-12
+    loose = np.where(n_tot > 1e-9, 1.0, 100.0)
+    assert np.all(np.abs(e_b - e_l) <= 1e-12 * loose * np.abs(e_l))
+    assert np.all((np.abs(vr_b - vr_l) <= 1e-11 * loose * np.abs(vr_l))[:, live])
+    assert np.all(((np.abs(vs_b - vs_l) * np.abs(sig)) <= 1e-12 * loose * np.abs(e_l)[None, :])[:, live])

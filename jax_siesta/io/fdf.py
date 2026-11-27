@@ -185,6 +185,7 @@ _FDF_USED = frozenset(
         "MaxSCFIterations", "NetCharge", "DFTD3", "PAO.BasisSize", "PAO.EnergyShift", "PAO.SplitNorm", "PAO.SplitNormH",
         "PAO.Basis", "User.Basis", "JSiesta.UseSymmetry", "kgrid.UseSymmetry", "JSiesta.Dispersion",
         "MD.TypeOfRun", "MD.Steps", "MD.NumCGsteps", "BandLines", "SCF.MustConverge",
+        "HFX.NumberOfGaussians", "HFX.ScreeningTolerance", "HFX.PatternScale",
     )
 )
 _SPIN_MODES = {
@@ -445,6 +446,13 @@ def parse_fdf(fdf_path: str | Path) -> dict[str, Any]:
     elif "meshsizes" in blocks and blocks["meshsizes"]:
         row = blocks["meshsizes"][0]
         mesh_sizes = (int(row[0]), int(row[1]), int(row[2]))
+    # Hybrid functionals (XC.Authors HSE06 ...): Gaussians per orbital shell and integral screening tolerance.
+    if "hfxnumberofgaussians" in scalars:
+        extra["hfx_n_gauss"] = int(scalars["hfxnumberofgaussians"][0])
+    if "hfxscreeningtolerance" in scalars:
+        extra["hfx_screen_tol"] = float(scalars["hfxscreeningtolerance"][0].lower().replace("d", "e"))
+    if "hfxpatternscale" in scalars:
+        extra["hfx_pattern_scale"] = float(scalars["hfxpatternscale"][0].lower().replace("d", "e"))
     config = SCFConfig(
         nspin=nspin,
         mesh_cutoff_ry=mesh_cut,

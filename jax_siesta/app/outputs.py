@@ -208,8 +208,9 @@ def write_outputs(
     out.mkdir(parents=True, exist_ok=True)
     label = results.label
     written: dict[str, Path] = {}
-    write_forces(out / f"{label}.FA", results)
-    written["FA"] = out / f"{label}.FA"
+    if results.observables.forces_available:
+        write_forces(out / f"{label}.FA", results)
+        written["FA"] = out / f"{label}.FA"
     write_eigenvalues(out / f"{label}.EIG", results)
     written["EIG"] = out / f"{label}.EIG"
     if restart_formats:

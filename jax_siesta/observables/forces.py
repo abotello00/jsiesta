@@ -43,7 +43,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_siesta.core.protocols import SymmetryProjector, bind_symmetry, symmetry_jit_arrays
+from jax_siesta.core.protocols import ExactExchange, SymmetryProjector, bind_symmetry, symmetry_jit_arrays
 from jax_siesta.core.types import (
     BasisData,
     KPointMesh,
@@ -66,7 +66,7 @@ from jax_siesta.grid.mesh import (
 )
 from jax_siesta.integrals.two_center import _iter_kb_shell_pairs, _kb_soc_shell_spin_matrix, kb_three_center_native
 from jax_siesta.xc.dispersion import DFTD3Dispersion, RVV10Dispersion
-from jax_siesta.xc.functional import LibxcFFIEvaluator, resolve_xc_id, xc_energy_from_grid
+from jax_siesta.xc.functional import LibxcFFIEvaluator, exact_exchange_spec, resolve_xc_id, xc_energy_from_grid
 
 
 def _stage(timings: dict[str, float] | None, key: str, t_start: float, *results: object) -> float:
@@ -423,6 +423,7 @@ class StaticObservableEvaluator:
         compute_forces_stress: bool = True,
         components_out: dict[str, np.ndarray] | None = None,
         timings_out: dict[str, float] | None = None,
+        exact_exchange: ExactExchange | None = None,
     ) -> Observables:
         r"""Execute mandatory post-SCF ``DM_out`` pass and compute variational forces & stress.
 
@@ -458,6 +459,10 @@ class StaticObservableEvaluator:
                 and ``grid_backward`` (the two halves of the reverse-mode derivative of the grid energy),
                 ``grid_components`` (only with ``components_out``), ``two_center``, ``moments`` and ``total``. Each
                 stage waits for its device work, so timing adds synchronisation points; ``None`` adds none.
+            exact_exchange: Optional exact-exchange stage of a hybrid functional (built here when omitted and the
+                functional is a hybrid). Its energy enters the total energy as ``e_exact_exchange_ha`` and its
+                derivatives at fixed density matrix enter the forces and the stress (``components_out`` then gets
+                an ``exact_exchange`` entry).
 
         Returns:
             Fully provenanced ``Observables`` PyTree.
@@ -535,8 +540,17 @@ class StaticObservableEvaluator:
             stress_disp_extra = jnp.zeros((3, 3), dtype=jnp.float64)
 
         t_mark = _stage(timings_out, "dispersion", t_mark, e_disp, f_disp, stress_disp_extra)
+        # Exact exchange of a hybrid functional, from the same unmixed density matrix.
+        if exact_exchange is None and exact_exchange_spec(config.xc_functional).is_hybrid:
+            from jax_siesta.hfx import build_exact_exchange
+
+            exact_exchange = build_exact_exchange(structure, basis, pattern, config, k_grid=kmesh.grid_shape)
+        e_exx = 0.0
+        if exact_exchange is not None:
+            e_exx = float(exact_exchange.matrix_and_energy(np.asarray(dm_out), config.nspin)[1])
+            t_mark = _stage(timings_out, "exact_exchange", t_mark)
         e_entropy = scf_state.entropy_ha
-        total_energy = e_kinetic + e_kb + e_na + e_hartree + e_xc + e_disp
+        total_energy = e_kinetic + e_kb + e_na + e_hartree + e_xc + e_disp + e_exx
         final_post_scf_free_e = total_energy + e_entropy
 
         # Harris-Foulkes free energy of the last SCF iteration (scf/driver.py, D-023). NaN (never an alias of the KS
@@ -634,6 +648,15 @@ class StaticObservableEvaluator:
                 + stress_grid
                 + stress_disp_extra
             )
+            if exact_exchange is not None:
+                # Exact exchange at fixed density matrix; its Pulay part is in the energy-density-matrix term above,
+                # because the eigenvalues that build E are those of the Hamiltonian with the exchange matrix.
+                f_exx, de_exx = exact_exchange.forces_and_strain_derivative(np.asarray(dm_out), config.nspin)
+                forces = forces + jnp.asarray(f_exx, dtype=jnp.float64)
+                stress = stress + jnp.asarray(de_exx, dtype=jnp.float64) / vol
+                if components_out is not None:
+                    components_out["exact_exchange"] = np.asarray(de_exx, dtype=np.float64) / vol
+                t_mark = _stage(timings_out, "exact_exchange", t_mark)
             # Symmetrize stress tensor (numerical noise cleanup)
             stress = 0.5 * (stress + stress.T)
 
@@ -692,4 +715,6 @@ class StaticObservableEvaluator:
             d_max=d_max,
             h_max_ha=h_max,
             xc_backend=xc_eval.backend_name,
+            e_exact_exchange_ha=e_exx,
+            forces_available=bool(compute_forces_stress),
         )

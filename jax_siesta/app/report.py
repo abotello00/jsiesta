@@ -224,6 +224,8 @@ def final_lines(results: Results) -> list[str]:
         f"jsiesta:       Hartree = {e['hartree']:18.6f}",
         f"jsiesta:    Exch.-corr = {e['xc']:18.6f}",
     ]
+    if e["exact_exchange"] != 0.0:
+        lines.append(f"jsiesta:  Exact exch. = {e['exact_exchange']:18.6f}")
     if results.config.dispersion.lower() != "none":
         lines.append(f"jsiesta:    Dispersion = {e['dispersion']:18.6f}")
     lines += [
@@ -232,6 +234,11 @@ def final_lines(results: Results) -> list[str]:
         f"jsiesta:         Total = {e['total']:18.6f}",
         f"jsiesta:       FreeEng = {e['free']:18.6f}",
         f"jsiesta:         Fermi = {results.fermi_level_ev:18.6f}",
+    ]
+    if not results.observables.forces_available:
+        lines += ["", "jsiesta: Forces and stress were not computed."]
+        return lines + _spin_and_timing_lines(results)
+    lines += [
         "",
         "jsiesta: Atomic forces (eV/Ang):",
     ]
@@ -247,6 +254,12 @@ def final_lines(results: Results) -> list[str]:
         "",
         f"jsiesta: Pressure (static): {p_ev * EV_PER_ANG3_TO_KBAR:14.6f} kBar  = {results.pressure_gpa:.6f} GPa",
     ]
+    return lines + _spin_and_timing_lines(results)
+
+
+def _spin_and_timing_lines(results: Results) -> list[str]:
+    """Spin moments (spin-polarised runs) and the elapsed times, the last part of the final section."""
+    lines: list[str] = []
     if results.config.nspin > 1:
         m = results.spin_moment
         lines += [

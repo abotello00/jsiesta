@@ -189,6 +189,38 @@ class RealSpaceGridOps(Protocol):
 
 
 @runtime_checkable
+class ExactExchange(Protocol):
+    r"""Protocol for the exact-exchange part of a hybrid functional.
+
+    Theory:
+        Returns the exchange contribution to the Hamiltonian, :math:`H^s_x = -K[P^s]` with the kernel and the
+        fractions of the functional, and its energy :math:`E_x = \frac{1}{2}\sum_s \mathrm{Tr}[P^s H^s_x]`,
+        so that :math:`\partial E_x/\partial P = H_x`.
+
+    Algorithm:
+        One implementation exists, ``jax_siesta.hfx.Nao2GtoExchange`` (Gaussian fits of the orbitals, screened
+        four-centre integrals). It runs on the host, outside the compiled SCF step.
+
+    Invariants:
+        - ``h_x`` has the shape of the density matrix and is Hermitian under edge transposition. For ``nspin``
+          4 and 8 it is complex, channels ``[uu, dd, Re ud, Im ud]`` like the density matrix.
+        - An object is tied to one geometry and one sparse pattern.
+        - The forces and the strain derivative are the derivatives of ``e_x`` at a fixed density matrix.
+
+    SIESTA Mapping:
+        None in SIESTA; ``setup_hfx`` in HONPAS.
+    """
+
+    def matrix_and_energy(self, dm: Any, nspin: int) -> tuple[Any, float]:
+        """Return ``(h_x, e_x)`` in Hartree for a density matrix of shape ``(n_spin, n_edges)``."""
+        ...
+
+    def forces_and_strain_derivative(self, dm: Any, nspin: int) -> tuple[Any, Any]:
+        """Return the forces (Hartree/Bohr) and the strain derivative of ``e_x`` (Hartree) at fixed ``dm``."""
+        ...
+
+
+@runtime_checkable
 class ExchangeCorrelation(Protocol):
     """Protocol for semilocal exchange-correlation evaluation (LDA/GGA/meta-GGA).
 

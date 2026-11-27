@@ -4,7 +4,7 @@
   (`jsiesta_v0.1`, D-001 to D-044) in one commit (D-045). Authorship: `AUTHORS_CONTRIBUTORS.md`.
 - **Current phase:** v0.1 complete: Phases 0–3 of `docs/design/IMPLEMENTATION_PLAN.md`, the review remediation and
   the GPU performance work (D-031 to D-044). Open items are listed under *Open issues*.
-- **Last updated:** 2026-11-24 (D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files, D-052 projection table and test memory, D-053 user interface and documentation)
+- **Last updated:** 2026-11-24 (D-055 Libxc 7, D-056 hybrid functionals on branch `feature/hybrid-functionals`; D-046 to D-048 fixed costs, D-049 and D-050 basis optimisation, D-051 SIESTA restart files, D-052 projection table and test memory, D-053 user interface and documentation)
 - **Status rule:** every "validated" entry below names the test that checks it against an *external* reference.
   Self-consistency tests alone do not count. Run `make check` (ruff, mypy, Doxygen + Sphinx -W, KG rebuild, pytest
   with JUnit XML in `reports/`); `make test-refs` makes missing SIESTA references fatal.
@@ -20,12 +20,40 @@
   Tutorials: `docs/tutorials/*.py` + executed `*.ipynb` (`make tutorials`, about 12 minutes on the laptop).
   Examples and PseudoDojo PSML files (H, C, O, Si): `examples/`.
 
+## Hybrid functionals (branch `feature/hybrid-functionals`, D-055 to D-058)
+
+- Plan and stage table: `docs/design/HYBRID_FUNCTIONALS_PLAN.md`. Stages 1 to 8 done: Libxc 5.1 to 7.x, hybrid
+  description from Libxc, Gaussian fit of the orbitals, integral engine, exchange matrix, SCF, forces and stress,
+  non-collinear spin and spin-orbit coupling, full-range hybrids in periodic systems.
+- Use: `xc_functional="HSE06"` (or `XC.Authors HSE06`); `PBE0`, `B3LYP` (in a crystal they need a k-point mesh at least as fine as the range of the sparse pattern, and an insulator); every `nspin` (D-058);
+  energies, eigenvalues, forces and stress (D-057); settings `hfx_n_gauss` (5) and `hfx_screen_tol` (1e-7).
+- Code: `jax_siesta/hfx/` (`nao2gto.py`, `exchange.py`), `cpp/src/eri.cpp`, `cpp/src/hfx.cpp`,
+  `cpp/include/jsiesta/libxc_compat.hpp`; the exchange is a host kernel called between compiled SCF steps.
+- Validation of `nspin` 4/8 and of periodic PBE0 is by identities and finite differences only (no external
+  reference). Truncation to the pattern, `E_x` per cell: Si 0.14 meV (HSE06), 2.1 meV (PBE0); diamond 1.5, 8.3 meV.
+- Known, unchanged (D-058): non-collinear GGA stress is not the strain derivative of the energy (3e-4 eV/Ang^3
+  for H3 at a 0.2 Ang mesh); mixers not covariant under spin rotation; Co atom with spin-orbit and HSE06 stalls
+  at 0.005 Ha electronic temperature.
+- HONPAS (D-059): binary `~/Work/codes/siesta-honpas/bin/siesta-honpas` (source `siesta-honpas-75c1e1c2f` next to it), key
+  `honpas_bin` in `tests/external_refs.local.toml`. Si HSE06 with the same orbitals and Gaussians: exchange energy 0.28 meV,
+  hybrid part of the total energy 0.24 meV and of the forces 2e-4 eV/Ang, bands 4 meV (unexplained). HONPAS prints a hybrid
+  stress without the exchange term (checked against differences of its own energy). Hand runs: `reports/honpas_compare/`.
+- Performance (D-060, Stage 9): each integral once for its eight orderings, one pass for the six derivative integrals,
+  incremental builds in the SCF. Si2 SZ, 3 Gaussians, laptop: build 42 -> 7 s, exchange gradient 199 -> 13 s, whole run
+  588 -> 50 s.
+- Pattern range and distance bound (D-061): `HFX.PatternScale` (`hfx_pattern_scale`, `build_sparse_pattern(orbital_range_scale=)`)
+  extends the pattern for `P` and `K`; Si HSE06 changes by 0.03 meV at 6x6x6 k (at 3x3x3 it does not converge: the density
+  matrix repeats within the pattern). Screened kernels also use a bound from Gaussian envelopes of the pair densities
+  (7 % fewer quartets on the standard pattern, 40 % on the doubled one). Open: half or more of the computed quartets are
+  still negligible in hindsight; d shells, larger systems, diamond and PBE0 on an extended pattern.
+
 ## Environment
 
 - `.venv` (Python 3.11) from `requirements-dev.txt`: jax/jaxlib 0.4.38, numpy 2.2.6, scipy 1.14.1, spglib 2.8.0,
   mcp 1.27, sphinx 8.2.3, ruff 0.15.7, mypy 2.4.1, dftd3 1.7.0 (optional extra `[dispersion]`), myst-nb 1.4.0,
   jupytext 1.19.7, matplotlib 3.11.2 (documentation notebooks). The package is installed in editable mode (`jsiesta` script).
-- `make ffi` builds `cpp/build/libjsiesta_ffi` with static Libxc from `/opt/etsf` (`JSIESTA_USE_LIBXC=ON`).
+- `make ffi` builds `cpp/build/libjsiesta_ffi` with Libxc from `LIBXC_ROOT` (else `/opt/etsf`); releases 5.1 to 7.x
+  work (tested 6.2.2, 7.0.0, 7.1.2; D-055). PySCF 2.15.1 is in the venv as the reference of the integral tests.
 - External references: keys in `tests/external_refs.toml` (empty; set them in `tests/external_refs.local.toml` or `JSIESTA_<KEY>`):
   standard SIESTA 5.4.2, `siesta_spglib_full_impl`, `pr_mgga` SIESTA, SIESTA `Tests/Pseudos`, `pr_mgga` Tests, the SIESTA documentation index,
   scf_params Co pilot. Quantum ESPRESSO 7.5 was used once to freeze `tests/fixtures/qe_rvv10`.
@@ -60,6 +88,12 @@
   file round trips, restart, exit codes). Not validated against SIESTA: `test_same_fdf_input_in_siesta_and_jsiesta`
   (needs `siesta_bin`) has never run; `.FA`/`.EIG`/`.bands` layouts follow the SIESTA sources but were not compared
   with SIESTA-written files
+- **Hybrid functionals (D-056):** integrals and the molecular exchange matrix validated against PySCF/libcint
+  (`tests/test_eri.py` 1e-10, `test_exchange_matrix_of_water_against_pyscf` 1e-9) with identities (supercell,
+  k-points against supercell, Kohn-Sham = Harris); forces and stress checked by finite differences of `E_x` at
+  fixed density matrix (1e-7) and of the total energy (mesh-limited, as for PBE); the hybrid SCF against HONPAS for Si
+  (`test_hse06_silicon_against_honpas`, D-059: change from PBE to HSE06 in energy, forces, bands; 400 s, gated)
+- **Libxc versions (D-055):** XC and meta-GGA tests pass with 6.2.2, 7.0.0 and 7.1.2; SIESTA parity not replayed with 7.x
 - **KG verification status:** from JUnit results since D-019 (`make kg-results`); `resume_session_context` separates verified (external reference passed), self-consistent only, failing, skipped and never run
 
 ## Upstream issues found (reported here, not fixed upstream)

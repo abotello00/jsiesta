@@ -354,3 +354,96 @@
   dictionary in `test_fdf_restart_keywords` gained `must_converge`).
   `test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage` was deselected (see the entry above).
   The JUnit file in `reports/` is from the run before those fixes; `make kg-results` was not rerun.
+
+### 2026-11-24 — Literature check for efficiency ideas; single-precision eigensolver measured (Claude Code)
+- Read the papers in the user's `Algo_devel` folder and the JAX-AMG repository against `known_bottlenecks.md`.
+  Not applicable to the current scope: algebraic multigrid and incomplete-Cholesky preconditioners (the only linear
+  system is the periodic Poisson equation, solved by FFT in 0.5 ms), sparse LU for selected inversion, distributed
+  block-sparse products, stochastic Green's functions, Tucker-tensor bases, hybrid functionals. Candidates for
+  500 atoms and above: single precision in the eigensolver (measured, D-054: 1.1-1.5x on the solve, not adopted),
+  Chebyshev-filtered subspace iteration with warm starts (not tested), the submatrix method as a later O(N) solver.
+- Open: accuracy and speed of `float32` matrix products on the A100 (D-054, last item); no code was changed.
+
+### 2026-11-24 — Hybrid functionals, stages 1 to 6 (branch `feature/hybrid-functionals`, Claude Code)
+- Plan written first: `docs/design/HYBRID_FUNCTIONALS_PLAN.md` (assessment of the HONPAS paper, design, validation
+  ladder, nine stages). Stages 1 to 6 done; 7 to 9 open.
+- Libxc 7 (D-055): the build failed because of a version test; replaced by feature tests. Running the XC tests
+  against 6.2.2, 7.0.0 and 7.1.2 found a NaN in Libxc 7.1.2 (PBE correlation, zero total gradient) and 1e-11
+  differences in vacuum; both handled.
+- Hybrids (D-056): Libxc description of the functional, Gaussian fit of the orbitals, own integral engine checked
+  against PySCF, exchange matrix on the sparse pattern, SCF and report integration, FDF keywords
+  (`XC.Authors HSE06`, `HFX.NumberOfGaussians`, `HFX.ScreeningTolerance`), theory note and user documentation.
+- Found on the way: the first exchange build was dominated by the arithmetic of the contractions, not by the Boys
+  function (tabulating it gained 10 %); an AVX2 copy of the quartet routine gained 10 to 25 %. Real gains need
+  fewer primitive quartets (Stage 9).
+- Open: no external reference for a hybrid SCF (HONPAS); forces; cost (15 s per build for Si single-zeta).
+
+### 2026-11-24 — Hybrid functionals, stage 7: forces and stress (Claude Code)
+- Derivative shell-pair expansions, gradient loop, observables (D-057). Finite-difference checks at three levels:
+  integrals, `E_x` at fixed density matrix, total energy of complete HSE06 runs.
+- The first full-suite run on the branch timed out in
+  `test_basis_enthalpy_optimization_explicit_params_and_pressure_shrinkage` (deselected before as well); the suite
+  was rerun without it.
+
+### 2026-11-25 — Hybrid functionals, stage 8: non-collinear spin, spin-orbit coupling, periodic full-range hybrids (Claude Code)
+- Spinor exchange (D-058): no change in the C++ kernels; real and imaginary parts of the spin blocks in Python,
+  Pauli components for the gradient; complex Hamiltonian for `nspin = 4` with a hybrid, imaginary parts in the
+  energy trace and in Hamiltonian mixing. Tests at the level of the exchange stage and of complete calculations
+  (`tests/test_hfx.py`, `tests/test_hfx_scf.py`).
+- Full-range hybrids in periodic systems: accepted when the k-point mesh is fine enough for the range of the
+  pattern, refused otherwise with the divisions needed. Truncation error measured for Si, diamond and an H2 chain.
+- Found: non-collinear GGA is not variational (stress against strain differences), the mixers are not covariant
+  under spin rotations after the second iteration, and the spin-orbit hybrid SCF of a Co atom stalls at low
+  electronic temperature. None of the three was changed; they are recorded in D-058.
+- Open: Stage 9 (performance), HONPAS comparison, an external reference for non-collinear and periodic full-range
+  hybrids, a long-range correction or an extended pattern for PBE0 in small-gap systems.
+
+### 2026-11-25 — Hybrid functionals: first comparison with HONPAS; start of stage 9 (Claude Code)
+- Reference binary: `~/Work/codes/siesta-honpas/bin/siesta-honpas` (source `~/Work/codes/siesta-honpas-75c1e1c2f`,
+  SIESTA 5 based, reads PSML, Libxc 7). It does not read the synthetic `tests/fixtures/psml` files; the
+  pseudopotentials of `examples/pseudos` work. Inputs and outputs of the runs below are in
+  `reports/honpas_compare/` (git-ignored): `si1` HONPAS with its own fit, `js1` jsiesta, `si2` HONPAS with the
+  fit of jsiesta, `si2_p`/`si2_m` lattice constant +-0.5 %, `pbe_h`/`pbe_j` PBE in both codes, `bench.py` one
+  exchange build at the PBE density matrix.
+- How the two codes are made to compute the same functional: jsiesta reads the `.ion.xml` written by HONPAS
+  (`User.Basis T`); the Gaussian fit of jsiesta is given to HONPAS in its `%block NAO2GTO` (same convention:
+  exponent and coefficient of `r^l exp(-a r^2)`, lines `n l zeta ngauss`); `HFX.UseFittedNAOs false` keeps the
+  numerical orbitals outside the exchange (the HONPAS default replaces them by the fits everywhere);
+  `HFX.FarField false` and the four HONPAS tolerances at 1e-10.
+- Case: Si2, one atom displaced (0.27, 0.25, 0.25), a = 5.43 Ang, SZ, 3x3x3 k-points, 100 Ry, HSE06, 3 Gaussians
+  per shell. jsiesta against HONPAS: exact-exchange energy -10.754616 / -10.754892 eV; semilocal XC -68.483154 /
+  -68.483300; kinetic 80.326440 / 80.327014; total -224.035794 / -224.030403 (PBE: -227.793232 / -227.787600, so
+  the offset is that of PBE, the neutral-atom term of D-025, and the hybrid adds 0.2 meV); largest force 1.132095 / 1.133837 eV/Ang (PBE 1.085932 /
+  1.087467); band extrema over the mesh within 4 meV (PBE 3e-5 eV), gap 1.967 / 1.971 eV.
+- Stress: HONPAS prints -0.156 eV/Ang^3 on the diagonal, jsiesta -0.077. `nao2gto_hfx_force.F90` has no stress
+  code. Central difference of the HONPAS total energy (+-0.5 % lattice constant): dE/dV = -0.0767 eV/Ang^3;
+  jsiesta analytic trace/3 = -0.0761; HONPAS printed -0.1549. The printed hybrid stress of HONPAS is not the
+  derivative of its energy; the one of jsiesta is, to the level at which the PBE stresses of the two codes agree (6e-4).
+- Not explained yet: band energies differ by up to 4 meV although the exchange energy agrees to 0.3 meV.
+  Hypothesis, not tested: HONPAS lists pairs by the radius of the Gaussians (`HFX.GaussianEPS`), jsiesta by the
+  cut-off radius of the orbitals.
+- Cost, same case, 8 threads on the laptop: jsiesta 42 s per exchange build (4.6e6 shell quartets computed,
+  1.9e6 screened, tolerance 1e-8) and 199 s for forces and stress; with 5 Gaussians more than 5 minutes per build.
+  HONPAS on one core: about 30 s per build at tolerances 1e-10. This is the starting point of stage 9.
+- Not done yet: the gated test `test_hse06_silicon_against_honpas` (still a placeholder), a decision entry.
+
+### 2026-11-25 — Hybrid functionals, stage 9: performance; HONPAS test (Claude Code)
+- D-060: shared integrals in the build and in the gradient, `eri_quartet_multi`, incremental builds. Build 42 -> 7 s,
+  gradient 199 -> 13 s, complete Si HSE06 run 588 -> 50 s on the laptop.
+- D-059: `test_hse06_silicon_against_honpas` written and passing (400 s); `tests/external_refs.local.toml` created
+  on this machine with `honpas_bin`.
+- Found: per core the build is now at the level of HONPAS (22 s against about 30 s); thread scaling on this laptop is
+  poor (frequency scaling). The pair-list convention (orbital radius against Gaussian extent) is worth 1.6 meV in the
+  exchange energy for 3 Gaussians. Incremental builds add noise of 1e-6 eV to tightly converged cycles.
+- Open: extended pattern, distance screening, the 4 meV band differences to HONPAS, d shells, larger systems.
+
+### 2026-11-25 — Hybrid functionals, stage 9: extended pattern and distance bound (Claude Code)
+- D-061: `HFX.PatternScale` (pattern builder, configuration, FDF, symmetry set-up) and a bound of the screened
+  integrals from Gaussian envelopes of the pair densities. Tests: `test_extended_pattern_for_the_exchange`,
+  `test_distance_bound_of_the_screened_kernel`.
+- Found: a bound from spheres with the orbital cut-off radii is exceeded by the integrals, because the fits have
+  tails; with the tails it removes nothing. A coarse k-point mesh makes the pattern scan meaningless (14 meV drift at
+  3x3x3). Counting the computed quartets that were negligible afterwards (temporary code) showed that the room
+  for better screening is a factor two to three.
+- Scripts and logs of the measurements: `reports/honpas_compare/` (`ext.py`, `ext_hse*.log`, `ext_dist.log`, `bench*.py`).
+

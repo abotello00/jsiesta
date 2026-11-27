@@ -12,8 +12,8 @@ Requirements
    * - C++ compiler and CMake
      - C++17 (GCC or Clang), CMake 3.20 or newer
    * - Libxc
-     - Version 6.x, needed for meta-GGA functionals and used for all functionals when present. Version 7.0.0
-       does not compile with the current sources.
+     - Versions 5.1 to 7.x (tested with 6.2.2, 7.0.0 and 7.1.2); needed for meta-GGA and hybrid functionals and
+       used for all functionals when present.
    * - `uv <https://docs.astral.sh/uv/>`_
      - Used by ``make venv`` to create the environment (plain ``pip`` works too, see below)
    * - Optional

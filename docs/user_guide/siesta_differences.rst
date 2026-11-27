@@ -11,7 +11,7 @@ Not implemented
   relaxations can be driven from Python (tutorial on molecular geometry).
 * **Pseudopotential formats other than PSML** (``.psf``, ``.vps``).
 * **Solvers other than diagonalisation** (order-N, PEXSI, ELSI, TranSIESTA).
-* **DFT+U, hybrid functionals, van der Waals density functionals other than rVV10**, external electric fields,
+* **DFT+U, van der Waals density functionals other than rVV10**, external electric fields,
   dipole corrections, charged-slab corrections.
 * **Occupation functions other than Fermi-Dirac**.
 * **Non-diagonal k-point grids, ``kgrid.Cutoff``, ``BandPoints``**.
@@ -19,6 +19,17 @@ Not implemented
 * **Outputs:** charge densities and potentials on the mesh, wavefunctions, PDOS, COOP, the ``.HSX`` file (the
   ``.nc`` file holds H and S).
 * **MPI.** Parallelism is by threads and GPU.
+
+Beyond SIESTA
+-------------
+
+* **Hybrid functionals** (``XC.Authors HSE06``, ``PBE0``, ``B3LYP``), with the method of
+  HONPAS: the exact exchange is computed from Gaussian fits of the orbitals. Energies, eigenvalues, forces and
+  stress, for every ``Spin`` mode, at a cost far above a GGA: 7 s for a full build of the exchange matrix
+  for bulk Si with a single-zeta basis and three Gaussians per orbital on an eight-thread laptop, less in the
+  later SCF steps. Compared with HONPAS for bulk Si with the same orbitals and Gaussians: the exchange energy
+  agrees to 0.3 meV and the band energies to 4 meV. The stress HONPAS prints for a hybrid does not contain the
+  exchange term; the one of jsiesta is the strain derivative of the energy.
 
 Different defaults
 ------------------

@@ -208,7 +208,7 @@ API_SECTIONS: dict[str, list[str]] = {
     "species": ["jax_siesta.species"],
     "integrals": ["jax_siesta.integrals"],
     "grid": ["jax_siesta.grid"],
-    "xc": ["jax_siesta.xc"],
+    "xc": ["jax_siesta.xc", "jax_siesta.hfx"],
     "symmetry": ["jax_siesta.symmetry"],
     "scf": ["jax_siesta.scf"],
     "observables": ["jax_siesta.observables"],
@@ -219,7 +219,8 @@ API_SECTIONS: dict[str, list[str]] = {
 CPP_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
     ("Two-centre integrals", ("two_center", "kb_three_center")),
     ("Orbital-grid kernels", ("grid_ffi", "grid_plan", "jsiesta::grid")),
-    ("Exchange-correlation kernels", ("xc_ffi", "grid_xc_ffi", "xc_semilocal", "jsiesta::xc")),
+    ("Exchange-correlation kernels", ("xc_ffi", "grid_xc_ffi", "xc_semilocal", "jsiesta::xc", "libxc_compat")),
+    ("Exact exchange", ("eri.", "hfx.", "jsiesta::eri")),
     ("CUDA kernels", ("kernels.cuh", "rhoofd_vmat", "jsiesta::cuda")),
 ]
 CPP_FALLBACK = "FFI registry, types and utilities"
@@ -230,6 +231,8 @@ CPP_INTROS = {
     "of a mesh potential (``vmat``), and the plan that stores which orbitals touch which mesh points.",
     "Exchange-correlation kernels": "Pointwise LDA, GGA and meta-GGA evaluation on the mesh, built in or through "
     "Libxc.",
+    "Exact exchange": "Four-centre electron repulsion integrals over Gaussian fits of the orbitals and the "
+    "screened construction of the exchange matrix of hybrid functionals.",
     "CUDA kernels": "GPU versions of the orbital-grid kernels and of the semilocal exchange-correlation.",
     CPP_FALLBACK: "Registration of the kernels with the XLA foreign-function interface, shared views of the "
     "arrays passed from Python, splines and threading helpers.",

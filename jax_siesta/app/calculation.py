@@ -47,6 +47,7 @@ from jax_siesta.core.types import (
     Structure,
 )
 from jax_siesta.grid.mesh import choose_mesh_dimensions
+from jax_siesta.hfx import build_exact_exchange
 from jax_siesta.integrals.two_center import TwoCenterEvaluator
 from jax_siesta.io.fdf import parse_fdf
 from jax_siesta.io.siesta_files import read_dm, structure_from_xv
@@ -335,6 +336,9 @@ class Results:
     def energies_ev(self) -> dict[str, float]:
         """Energy terms in eV: total, free, Harris, kinetic, neutral-atom, non-local, Hartree, xc, dispersion, -TS.
 
+        For a hybrid functional ``xc`` is the semilocal part and ``exact_exchange`` the exact-exchange part (zero
+        otherwise).
+
         ``neutral_atom`` corresponds to SIESTA's ``Ena + DEna``, ``nonlocal`` to ``Enl``, ``hartree`` to
         ``DUscf`` (the Hartree energy of the density minus the neutral-atom density).
         """
@@ -348,6 +352,7 @@ class Results:
             "nonlocal": float(o.e_kb_ha) * HARTREE_TO_EV,
             "hartree": float(o.e_hartree_ha) * HARTREE_TO_EV,
             "xc": float(o.e_xc_ha) * HARTREE_TO_EV,
+            "exact_exchange": float(o.e_exact_exchange_ha) * HARTREE_TO_EV,
             "dispersion": float(o.e_disp_ha) * HARTREE_TO_EV,
             "entropy_term": float(o.e_entropy_ha) * HARTREE_TO_EV,
         }
@@ -765,7 +770,7 @@ class Calculation:
             )
             two_center = sym_proj.evaluate_irreducible_two_center(structure, basis, pattern, config)
         else:
-            pattern = build_sparse_pattern(structure, basis)
+            pattern = build_sparse_pattern(structure, basis, orbital_range_scale=config.hfx_pattern_scale)
             kmesh = build_monkhorst_pack_mesh(self.k_grid, self.k_shift)
             mesh_shape = mesh_shape or choose_mesh_dimensions(
                 structure.cell, config.mesh_cutoff_ry, criterion=config.mesh_criterion,
@@ -794,16 +799,26 @@ class Calculation:
         say("")
         say(report.SCF_HEADER)
         t_scf = time.perf_counter()
+        # Exact exchange of a hybrid functional: one stage per geometry, shared by the SCF and the final energy.
+        exact_exchange = build_exact_exchange(structure, basis, pattern, config, k_grid=self.k_grid)
+        if exact_exchange is not None:
+            spec = exact_exchange.spec
+            say(
+                f"jsiesta: hybrid functional: exact exchange alpha = {spec.alpha:g}, beta = {spec.beta:g}, "
+                f"omega = {spec.omega:g} Bohr^-1; {config.hfx_n_gauss} Gaussians per shell, largest fit residual "
+                f"{max(g.residual for sh in exact_exchange.species_shells for g in sh):.1e}"
+            )
         state, mesh_shape = run_scf(
             structure, basis, pattern, two_center, kmesh, config, mesh_shape=mesh_shape, sym_proj=sym_proj,
-            initial_dm=initial_dm, initial_h=initial_h, callback=_on_iteration,
+            initial_dm=initial_dm, initial_h=initial_h, callback=_on_iteration, exact_exchange=exact_exchange,
         )
         timings["scf"] = time.perf_counter() - t_scf
         if state.outcome in ("numerical_breakdown", "invalid_input"):
             raise RuntimeError(f"SCF failed: {state.outcome} after {len(history)} iterations.")
         t_obs = time.perf_counter()
         obs = StaticObservableEvaluator().evaluate(
-            structure, basis, pattern, two_center, kmesh, state, config, mesh_shape=mesh_shape, sym_proj=sym_proj
+            structure, basis, pattern, two_center, kmesh, state, config, mesh_shape=mesh_shape, sym_proj=sym_proj,
+            exact_exchange=exact_exchange,
         )
         if sym_proj is not None:
             obs = replace(obs, active_symmetry_ops=sym_proj.n_ops, magnetic_subgroup=sym_proj.subgroup_label)

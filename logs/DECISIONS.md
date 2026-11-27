@@ -1178,3 +1178,269 @@
   The O2 binding energy of the solutions notebook (7.67 eV, converged PBE about 6.2 eV) is reported there with
   the two effects known to raise it (superposition error, spherical atom), not separated.
 
+
+## D-054: Single-precision eigensolver with a double-precision correction: measured, not adopted (2026-11-24)
+
+- **Why:** from 512 Si atoms the dense solve is half of an A100 SCF iteration (`known_bottlenecks.md` 9.1). The
+  literature (Katbashev et al., J. Chem. Phys. 163, 132501 (2025); Khadatkar and Motamarri, J. Chem. Phys. 159, 031102
+  (2023)) reports 1.5-2x from single precision on GPUs. Tested before touching the solver.
+- **Measured (one A100, Snellius job 29663197, JAX 0.12.1, best of 3, standalone script, no jsiesta code):** symmetric
+  matrix with a known spectrum and known eigenvectors, modelled on the orthogonalised Hamiltonian of bulk Si in DZP
+  (2/13 of the states in a valence band 0.45 Ha wide, gap 0.02 Ha, the rest up to 3.5 Ha; 300 K). `f32` is
+  `jnp.linalg.eigh` in `float32`; `+rq` adds `float64` Rayleigh quotients (one product); `+oa` adds one
+  Ogita-Aishima refinement step in `float64` (four products), rotating only resolved pairs (`|E_ij| < 1e-3`).
+
+  Seconds for `eigh` in f64, `eigh` in f32, f32+rq and f32+oa, then the speed-up of the last three:
+  832 orbitals 0.0113, 0.0100, 0.0102, 0.0107 (1.13, 1.11, 1.06);
+  1664 orbitals 0.0289, 0.0253, 0.0260, 0.0281 (1.14, 1.11, 1.03);
+  2808 orbitals 0.0906, 0.0647, 0.0674, 0.0762 (1.40, 1.34, 1.19);
+  6656 orbitals 0.684, 0.531, 0.563, 0.664 (1.29, 1.21, 1.03);
+  13000 orbitals 3.89, 2.56, 2.79, 3.52 (1.52, 1.39, 1.11).
+  Errors at 13000 orbitals (f64 / f32 / f32+rq / f32+oa): density matrix, largest element 4e-15 / 8e-7 / 8e-7 / 5e-8;
+  electron count 1e-13 / 1e-3 / 1e-3 / 1e-3 (of 4000; it follows the 6e-6 loss of orthonormality, which the capped
+  refinement does not remove); band energy from the eigenvalues 0 / 2e-4 / 7e-8 / 7e-8 Ha. The uncapped
+  Ogita-Aishima step made the vectors worse (closely spaced eigenvalues), hence the cap.
+- **Decision:** not adopted. The gain on the solve is 1.1-1.5x, which is at most about 10 % of the iteration at 512
+  atoms and about 25 % at 1000 atoms, and it costs a density matrix accurate to 1e-6 or a correction that returns
+  most of the time.
+- **Not checked:** real jsiesta matrices and an SCF run to convergence; metals (the capped refinement does not correct
+  partially occupied, closely spaced states); k-points (complex matrices); the CPU. One `float32` product at 13000
+  orbitals took 0.033 s against 0.229 s in `float64` (tensor cores are a possible cause; its accuracy was not
+  measured), so a purification in `float32` built on products could be faster than `eigh`; this was not tested.
+- **Data:** `reports/perf/job29663197/` (script, job file, output, JSON; the directory is not under version control).
+
+## D-055: Libxc 5.1 to 7.x: feature tests instead of a version test, and two guards for 7.1 (2026-11-24)
+
+- **Why:** hybrid functionals read their parameters from Libxc, and the code did not compile with Libxc 7: it
+  assumed `xc_hyb_type()` for major version 7, an interface of the development line that was not released (7.0.0 and
+  7.1.2 keep `XC_FAMILY_HYB_*`, `xc_hyb_exx_coef` and `xc_hyb_cam_coef`).
+- **Decision:** `cpp/include/jsiesta/libxc_compat.hpp` classifies functionals by the macros of the header
+  (`libxc_semilocal_family`, `libxc_is_hybrid`). CMake honours `LIBXC_ROOT` before any other Libxc and prints the
+  version. New queries `jsiesta_libxc_version` and `jsiesta_libxc_hybrid_coef`. Two findings with 7.1.2:
+  (i) PBE-type correlation returns NaN derivatives when the total density gradient is exactly zero while the spin
+  gradients are not (opposite spin gradients); `guarded_sigma_ud` in `xc_ffi.cpp` keeps the total at 1e-12 of the
+  spin gradients. (ii) Below 1e-9 a.u. 7.1.2 differs from 6.2.2, 7.0.0 and the built-in kernels by up to 1.4e-11
+  (energy) and 1.1e-10 (potential) relative, consistent with a more accurate `log(1 + x)` in PW92; the tolerance
+  of `test_builtin_xc_kernel_matches_libxc` is 100 times looser in that range only.
+- **Effect (laptop):** `tests/test_phase1_grid_xc.py` and `tests/test_mgga_soc.py`: 31 passed, 1 skipped with each
+  of 6.2.2, 7.0.0 and 7.1.2; functional metadata identical for the three. The guard leaves the 7.0.0 energy of the
+  test density unchanged to all 16 digits.
+- **Not checked:** the SIESTA parity tests with Libxc 7 (no SIESTA binary on this machine); Libxc 5.x; the GPU
+  build.
+
+## D-056: Hybrid functionals by Gaussian fits of the orbitals (NAO2GTO), first version (2026-11-24)
+
+- **Why:** request to support hybrid functionals following the HONPAS paper (Shang et al., Comput. Phys. Commun.
+  254, 107204 (2020)). Plan, assessment of the paper and stage table: `docs/design/HYBRID_FUNCTIONALS_PLAN.md`.
+- **Decision:** the method of the paper is adopted (fit of the radial functions with Gaussians, analytic four-centre
+  integrals, exchange matrix on the sparse pattern with Schwarz and density screening, truncation of `P` and `K`
+  to the pattern); its MPI master/worker distribution is not (threads over bra shell pairs). Components:
+  `xc/functional.py::exact_exchange_spec` (alpha, beta, omega from Libxc; names `HSE06`, `PBE0`, `B3LYP`); the
+  Libxc route evaluates a hybrid through the kernel of its semilocal family (it went to the LDA kernel before);
+  `hfx/nao2gto.py` (fit); `cpp/src/eri.cpp` (own McMurchie-Davidson engine, shells of real solid harmonics up to
+  `l = 4`, kernels `1/r` and `erfc(omega r)/r`); `cpp/src/hfx.cpp` (lattice sums); `hfx/exchange.py`
+  (`Nao2GtoExchange`, protocol `ExactExchange`). In the SCF the exchange matrix joins the density-dependent
+  Hamiltonian and its energy the exchange-correlation energy of each step, so the Kohn-Sham and Harris
+  bookkeeping is unchanged. Full-range hybrids are refused for crystals (the lattice sum over the orbital-range
+  supercell is adequate for the short-range kernel only). Forces and stress are returned as NaN with
+  `forces_available = False`. PySCF is a test-only dependency.
+- **Effect (laptop, 8 threads), integrals:** against PySCF/libcint, all shell types to `l = 3` and two with
+  `l = 4`, three kernels, three geometries, agreement 1e-10 (`tests/test_eri.py`).
+- **Effect, exchange matrix:** `K[P]` of water (DZP, 23 orbitals) against PySCF for the same Gaussians and density
+  matrix agrees to 1e-9 for the HSE06 kernel and a mixed kernel (`tests/test_hfx.py`). `K` of a unit cell equals
+  `K` of its 2x1x1 supercell (1e-11); symmetry and linearity hold.
+- **Effect, SCF:** HSE06 for a hydrogen chain with 4 k-points equals the doubled cell with 2 k-points to 2e-6 eV;
+  Kohn-Sham, in-flight and Harris energies agree at convergence (`tests/test_hfx_scf.py`). Water (DZP, 100 Ry):
+  gap 8.24 eV (PBE), 10.55 eV (HSE06), 11.37 eV (PBE0); 25 s against 5 s for PBE. Bulk Si (single-zeta, 4x4x4
+  k-points, 4 Gaussians, tolerance 1e-6): gap on the mesh 1.98 eV (PBE) and 2.51 eV (HSE06); 118 s for 5
+  iterations, 15 s per exchange build (516 504 quartets, 240 microseconds of thread time each).
+- **Effect, tolerances (bulk Si, single-zeta):** screening 1e-6 against 1e-12 changes `E_x` by 0.7 meV per cell and
+  `H_x` by at most 0.3 meV; 1e-5 by 4 and 7 meV. Fit residual 1 to 2.5 % of the orbital norm for 5 to 8 Gaussians
+  (H, O, Si DZP); `E_x` of Si moves by +69 meV (3 Gaussians) and -25 meV (5) relative to 4, per two-atom cell: the
+  fit is not converged.
+- **Not checked:** HONPAS (no binary; `test_hse06_silicon_against_honpas` is a skipped placeholder), so the SCF
+  results have no external reference; the truncation to the pattern; DZP bulk Si (cost); symmetry-reduced runs;
+  the GPU build (the exchange runs on the host there); memory for larger cells (every shell pair of every image
+  stores its Hermite expansion).
+- **Open:** forces and stress (Stage 7), `nspin` 4 and 8 and periodic full-range exchange (Stage 8), performance
+  (Stage 9: permutation symmetry, incremental builds, sparse Hermite coefficients; the hybrid route also computes
+  an unused kinetic-energy density because all Libxc ids go through the meta-GGA route).
+
+## D-057: Forces and stress of the exact exchange (2026-11-24)
+
+- **Why:** Stage 7 of `docs/design/HYBRID_FUNCTIONALS_PLAN.md`; D-056 returned NaN forces for hybrids.
+- **Decision:** derivative integrals from two kinds of derivative expansions of a shell pair
+  (`make_shell_pair_mode`): with respect to the first centre (neighbouring Cartesian powers) and with respect to a
+  translation of the pair (shift of the Hermite index); both go through the unchanged `eri_quartet`. The quartet
+  sum is symmetric under the exchange of the orbitals of each pair and of the pairs, so one derivative per quartet
+  gives the force (factor 4) and, with the pair-translation derivative, the strain derivative
+  (`jsiesta_hfx_gradient`, `Nao2GtoExchange.forces_and_strain_derivative`). The integrals are contracted with the
+  two density-matrix blocks on the fly. The Pulay part needs nothing new: the energy-density matrix is built from
+  the eigenvalues of the Hamiltonian with the exchange matrix. `StaticObservableEvaluator` adds the term; NaN
+  forces for hybrids are gone (`forces_available` now only says whether forces were requested).
+- **Effect (laptop):** derivative integrals against fourth-order differences of the integrals: 5.6e-11 relative
+  (shells to `l = 3`, three kernels). `E_x` at fixed density matrix, triclinic periodic cell and water: forces
+  within 1e-6 to 7e-9 Ha/Bohr of central differences, strain derivative within 2e-8 to 5e-10 Ha, net force 1e-15.
+  Complete HSE06 calculations against differences of the free energy: force on H in water 4.254661 against
+  4.253432 eV/Ang (PBE at the same mesh: 4.509672 against 4.507678); stress of a hydrogen chain -0.0611738 against
+  -0.0611633 eV/Ang^3 (PBE: -0.0624571 against -0.0624438). The mesh limits both functionals equally.
+- **Not checked:** HONPAS forces; symmetry-reduced runs with a hybrid; the cost for a realistic system (six integral
+  evaluations per quartet, once per calculation); the screening of the gradient uses the Schwarz bounds of the
+  undifferentiated integrals, which is not a rigorous bound for the derivatives.
+
+## D-058: Hybrid functionals for non-collinear spin and spin-orbit coupling; full-range hybrids in periodic systems (2026-11-25)
+
+- **Why:** Stage 8 of `docs/design/HYBRID_FUNCTIONALS_PLAN.md`. Hybrids were limited to `nspin` 1 and 2, and
+  PBE0/B3LYP to isolated systems.
+- **Decision, spin:** `H^{ss'}_x = -K[P^{ss'}]` for the four spin blocks. The kernels are unchanged (they never
+  assumed a symmetric density matrix): `matrix_and_energy` sends six real matrices (real and imaginary parts of
+  `uu`, `dd`, `ud`), and the gradient eight (real and imaginary parts of the Pauli components, which are
+  symmetric and antisymmetric, the two cases for which one derivative per quartet stands for four). The exchange
+  matrix of `uu` and `dd` has an imaginary part without spin-orbit coupling, so with a hybrid the Hamiltonian of
+  `nspin = 4` is complex; `_trace_dm_h` includes the imaginary parts of the diagonal blocks, and Hamiltonian
+  mixing mixes them (six real channels) instead of keeping the spin-orbit part of `H0` fixed.
+- **Decision, full range:** the lattice sum over the density matrix on the sparse pattern is finite, so it is
+  used as it is, without a correction for the long-range tail. It is refused when the density matrix repeats
+  within the pattern, that is when the translations of the pattern along a direction span as many cells as the
+  k-point mesh has divisions (`build_exact_exchange` takes `k_grid`). The blanket refusal for periodic systems
+  is gone. The screened kernel is not restricted (its error from repeated values is the usual finite-size error).
+- **Effect (laptop), spin:** `K` of a matrix without symmetry against PySCF, 1e-9 relative. Random spinor density
+  matrix in a triclinic periodic cell: collinear limit equals `nspin = 2` (1e-13), energy invariant and matrix
+  covariant under an SU(2) rotation (1e-12), `dE = Re Tr[dP^dagger H_x]` (1e-9), forces and strain derivative
+  against central differences 2e-8 Ha/Bohr and 1e-10 Ha. SCF: two iterations of HSE06 in two spin frames agree to
+  3e-11 eV (8e-5 eV when the imaginary part of `H_x` is dropped); Co atom with HSE06, `nspin` 2 against 4,
+  1e-9 eV; Co atom with spin-orbit coupling, two moment directions, 1e-7 eV. Stress of a non-collinear H3
+  triangle with LDA0 against strain differences of the free energy: 0.0022887 against 0.0022925 eV/Ang^3
+  (3.8e-6); Slater exchange through the same Libxc route without exact exchange deviates by 2.5e-6, and the
+  exchange term at the converged density matrix by 1e-9.
+- **Effect, full range:** PBE0 for a hydrogen chain, one cell with six k-points against two cells with three,
+  equal to 1e-15 eV. Error of truncating density matrix and exchange matrix to the pattern, measured as the
+  change of `E_x` per cell when the pattern range is doubled (single-zeta basis, three Gaussians, PBE density
+  matrix, 8x8x8 k-points; script and output in `reports/perf/hfx_truncation/`): Si 0.14 meV (HSE06) and 2.1 meV
+  (PBE0); diamond 1.5 and 8.3 meV; H2 chain 0.03 and 0.2 meV. The PBE0 values still move by 0.3 to 0.5 meV
+  between 1.5 and 2 times the range. With repeated values (hydrogen chain, pattern extended across the vacuum
+  with one k-point) the PBE0 `E_x` went from -4.0 to -14.5 eV for four times the range, HSE06 from -3.17 to
+  -3.39 eV and converged: this is the case that is refused.
+- **Found on the way (not changed):** (1) the non-collinear GGA route is not variational: PBE, `nspin = 4`, H3
+  triangle, stress against strain differences 3e-4 eV/Ang^3 at a 0.2 Ang mesh and 8.5e-5 at 0.1 Ang; LDA 4e-9;
+  collinear PBE 3.5e-6. (2) The mixers are not covariant under a rotation of the spin axes: PBE energies of two
+  frames agree exactly after two iterations and differ by 2.6e-3 eV after three; converged energies agree.
+  (3) Co atom with spin-orbit coupling and HSE06 at an electronic temperature of 0.005 Ha: energy converged to
+  1e-7 Ha but the Hamiltonian residual stays at 2e-5 Ha for 150 iterations, in all channels, with either mixing
+  target; it converges in 34 iterations at 0.02 Ha. (4) A central-difference step of 1e-3 Ang in the fixed-density
+  force test had an error of 3e-7 Ha/Bohr for the larger spinor matrices; the step is now 2.5e-4 Ang.
+- **Not checked:** an external reference for a non-collinear or periodic full-range hybrid SCF (PySCF with
+  periodic boundary conditions was considered and not set up); full-range hybrids for small-gap systems and
+  metals, where the truncated sum is not expected to be valid; self-consistent effect of the truncation (the
+  measurement is at a PBE density matrix); symmetry-reduced runs with a hybrid; forces of a non-collinear hybrid
+  against energy differences (only the stress, because of the egg-box error of the H3 test); a crystal with
+  spin-orbit coupling; the cause of item (3). SIESTA-format Hamiltonian and density-matrix files of `nspin = 4`
+  hold four real components, so the imaginary part of the diagonal blocks is not written or read back.
+
+## D-059: Hybrid SCF compared with HONPAS (2026-11-25)
+
+- **Why:** the hybrid SCF had no external reference (D-056 to D-058 rest on PySCF for the integrals and the
+  molecular exchange matrix, and on identities). A HONPAS build became available
+  (`~/Work/codes/siesta-honpas/bin/siesta-honpas`, SIESTA 5 based, PSML, Libxc 7).
+- **Decision:** `test_hse06_silicon_against_honpas` replaces the placeholder (key `honpas_bin`). The two codes are
+  made to evaluate the same functional. jsiesta reads the orbitals HONPAS writes (`User.Basis T`, `.ion.xml`).
+  HONPAS reads the Gaussian fit of jsiesta in `%block NAO2GTO` (same convention, exponent and coefficient of
+  `r^l exp(-a r^2)`), keeps the numerical orbitals outside the exchange (`HFX.UseFittedNAOs false`; its default
+  replaces them by the fits in every term), and runs with `HFX.FarField false` and its four tolerances at 1e-8.
+  A PBE run of each code gives the difference that exists without a hybrid; the test compares the change from PBE
+  to HSE06 and the exact-exchange energy.
+- **Effect (measured, Si2 with one atom displaced, SZ, 3x3x3 k-points, 100 Ry, 3 Gaussians per shell):**
+  exact-exchange energy -10.754616 eV against -10.754892 eV (0.28 meV); total energy -224.035794 against
+  -224.030403 eV, of which 5.6 meV is the PBE difference (neutral-atom term, D-025), so the hybrid adds 0.24 meV;
+  hybrid part of the largest force 0.046163 against 0.046370 eV/Ang; band extrema over the mesh within 4 meV
+  (PBE: 3e-5 eV), gap 1.967 against 1.971 eV. The test takes 400 s here, 330 s of them in HONPAS on one core.
+- **Finding, stress of HONPAS:** HONPAS prints -0.155 eV/Ang^3 (trace/3) for this case, jsiesta -0.0761.
+  `nao2gto_hfx_force.F90` contains no stress. The central difference of the HONPAS total energy for a lattice
+  constant changed by 0.5 % up and down is -0.0767 eV/Ang^3. The stress of jsiesta is the derivative of the energy to the level
+  at which the PBE stresses of the two codes agree (6e-4 eV/Ang^3); the hybrid stress printed by HONPAS is not.
+- **Finding, pairs beyond the cut-off radius:** jsiesta lists shell pairs by the cut-off radii of the orbitals,
+  HONPAS by the extent of the Gaussians (`HFX.GaussianEPS`). Scaling the radii of the pair list in jsiesta by 1.3
+  changes the exchange energy by -1.6 meV and the matrix by at most 0.4 meV (3 Gaussians, whose tails are long).
+  This is of the size of the 0.28 meV difference in the energy; it does not explain 4 meV in the bands.
+- **Not checked:** the origin of the 4 meV band differences (candidates not tested: `HFX.TruncateDM`, the
+  pair lists, the screening of HONPAS); other systems, basis sizes with d shells, spin, PBE0, more Gaussians;
+  the HONPAS default mode (fitted orbitals everywhere), which is a different functional; forces at tolerances
+  tighter than 1e-8.
+
+## D-060: Exchange build and gradient: shared integrals, shared derivative tables, incremental builds (2026-11-25)
+
+- **Why:** Stage 9. For the case of D-059 one exchange build took 42 s and the gradient 199 s on the laptop
+  (8 threads), against about 30 s per build for HONPAS on one core; with 5 Gaussians a build took over 5 minutes.
+- **Decision 1, each integral once:** `(ab|cd)` serves up to eight contributions `K[x,y] += P[z,w] (xz|yw)`. The
+  loops over (bra pair, block of `K`, ket pair) are unchanged; for each item the images under the eight orderings
+  that exist as items are found (`find_images`), the first in a fixed order of the keys computes the integral and
+  applies all of them. Nothing is assumed about the symmetry of `P`. The screening uses the largest density-matrix
+  block of the images. In the gradient the four orderings within the bra and within the ket are shared: the
+  derivative with respect to the second centre is the pair-translation derivative minus that of the first.
+- **Decision 2, one pass for the six derivative integrals:** the Hermite integrals and their contraction with the
+  ket do not depend on the Hermite coefficients of the bra, and the six derivative expansions of a pair have the
+  same primitives. `eri_quartet_multi` does the pass once and one final contraction per expansion.
+- **Decision 3, incremental builds:** `Nao2GtoExchange(incremental=True)` (set by `build_exact_exchange`) applies
+  the kernel to the change of the density matrix since the previous call, with 0.1 times the screening tolerance,
+  and builds in full again after 8 steps. Off by default for direct use of the class.
+- **Effect (measured, case of D-059, i7-10510U, 8 threads, tolerance 1e-8):** build 42.3 -> 7.1 s (shell quartets
+  computed 4.57e6 -> 0.85e6), on one core 22 s; gradient 199 -> 62.8 s (shared orderings) -> 12.7 s (shared
+  tables), results equal to 1e-15 between the last two and within the screening noise otherwise (strain
+  derivative 0.1108721 before, 0.1108925 after, 0.1108858 at tolerance 1e-11); complete calculation with forces
+  and stress 588 s (6 iterations) -> 50 s (8 iterations; SCF 27 s). With the factor 0.01 on the incremental
+  tolerance: 6 iterations, SCF 40 s; with 0.1 the energies of successive iterations scatter by 1e-6 eV at
+  `DM.Tolerance 1e-6`. Timings on this laptop vary by tens of percent with its temperature.
+- **Measured and not adopted:** a looser primitive tolerance (1e-8 instead of 1e-12: 7.5 -> 7.0 s; at 1e-6 the
+  matrix changes by 0.1 meV). Screening tolerance 1e-6: 2.9 s, energy 0.3 meV, matrix 0.08 meV off.
+- **Not checked / not done:** the extended pattern for `K` and a distance-dependent bound for the short-range
+  kernel (both in the plan); thread scaling beyond this laptop (4 cores: 12.7 s against 22 s on one, with
+  frequency scaling); systems with d shells or many atoms; the incremental build with `nspin` 4 and 8 beyond the
+  existing tests; a profile of the integral routine (no profiler on this machine).
+
+## D-061: Extended pattern for the exact exchange; distance bound for the screened kernel (2026-11-25)
+
+- **Why:** the two items of Stage 9 left open by D-060. The density matrix and the exchange matrix were kept
+  only on orbital pairs that overlap (or share a projector), and the screening used the Schwarz bound alone,
+  which does not decay with the distance between the two pair densities.
+- **Decision, extended pattern:** `build_sparse_pattern(orbital_range_scale=s)` adds the orbital pairs within
+  `s` times the sum of their radii. `SCFConfig.hfx_pattern_scale` (FDF `HFX.PatternScale`, default 1) passes it
+  from `Calculation.run` and from the symmetry set-up. The whole calculation runs on the extended pattern; the
+  overlap and the semilocal Hamiltonian vanish on the extra pairs, the density matrix and the exchange matrix do
+  not. The shell pairs of the integrals are unchanged (orbitals that overlap).
+- **Decision, distance bound:** for a kernel without full-range part, each shell pair gets a Gaussian envelope of
+  its density, `|phi_i phi_j|(r) <= w exp(-gamma |r - c|^2)`. It is found numerically when the pairs are built:
+  the product of the radial fits (with their tails, to the radius beyond which the norm is below 1e-12) times
+  the largest value of the angular parts, sampled on 32 x 24 points in cylindrical coordinates; centre at the
+  centroid; exponent among 0.25, 0.5 and 0.75 of the sum of the smallest exponents, whichever gives the smallest
+  charge; height raised by 30 % for the sampling. A quartet is then bounded by the short-range interaction of two
+  Gaussians, `q1 q2 [erf(sqrt(alpha) R) - erf(sqrt(alpha_s) R)]/R`, and the screening uses the smaller of this
+  and the Schwarz product. `jsiesta_hfx_set_distance_screening` and `Nao2GtoExchange(distance_screening=...)`
+  switch it off.
+- **Tried first and replaced:** a bound from the gap between two spheres that contain the pair densities,
+  `A_ab A_cd erfc(omega d)/d`. With spheres of the orbital cut-off radii it removed 25 % of the quartets of the
+  standard pattern, but the integrals exceeded it (by up to 2.6, 5554 cases) because the fits have tails beyond
+  the cut-off radius, and the matrix changed by 0.016 meV. With spheres that contain the tails it was never
+  exceeded and removed 0.2 % (standard pattern) and 1.5 % (doubled pattern).
+- **Effect, extended pattern (measured, Si2 of D-059, 3 Gaussians, tolerance 1e-8, 6x6x6 k-points):** edges 4704,
+  7536, 17452 for scale 1, 1.5, 2; total energy -224.617102, -224.617070, -224.617074 eV, so the truncation of
+  the standard pattern is 0.03 meV per cell here; largest force 1.047504, 1.047532, 1.047544 eV/Ang; time of the
+  complete run 49, 80, 177 s (before the distance bound). PBE on the extended pattern: energy, forces and stress
+  unchanged to the digits printed.
+- **Finding, coarse k-point meshes:** with 3x3x3 k-points the same scan gives -224.035795, -224.042038,
+  -224.050051 eV: the energy moves by 14 meV and does not converge. The density matrix repeats every three
+  cells (21.8 Bohr), so a pattern of longer range adds further periodic copies, each damped only by the kernel.
+  This is the finite-size error of a screened hybrid at that mesh, already present in the standard pattern; the
+  extension is meaningful when the k-point mesh spans the range of the pattern.
+- **Effect, distance bound (same case):** standard pattern, one build at the PBE density matrix: quartets
+  848314 -> 791444 at tolerance 1e-8 (matrix changed by 0.001 meV), 315352 -> 265693 at 1e-6. Doubled pattern,
+  complete run: quartets per build 2.78e6 -> 1.67e6, time 169 -> 105 s, total energy -224.617074 -> -224.617073
+  eV. The bound was never exceeded by a computed integral (checked with temporary code on 0.8e6 and 1.7e6 quartets
+  per build).
+- **Measured, not acted on:** of the quartets computed with the bound, 46 % (standard pattern) and 68 %
+  (doubled) have a largest element times density matrix below the tolerance. A sharper estimate could gain up
+  to a factor of two to three.
+- **Not checked:** the extended pattern for a system where the truncation is larger (diamond: 1.5 meV with HSE06
+  at a fixed density matrix, D-058) and for PBE0; the envelope for d shells and for fits with more Gaussians;
+  the extended pattern with symmetry reduction (the option is passed to the symmetry set-up, no test runs it); the effect of
+  the bound on the gradient separately from the build; HONPAS with a matching range (it has no such option).
+

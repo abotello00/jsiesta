@@ -451,3 +451,23 @@ Next: thread or offload the meta-GGA Libxc call (still on the host, 0.2 s of the
 r2SCAN iteration at 64 atoms); the remaining two-centre set-up (5.9 s at 64 atoms on the laptop, mostly the overlap
 integrals).
 
+**D-060, exact exchange of hybrid functionals (laptop, i7-10510U, 8 threads):** Si2, single-zeta orbitals of radius
+6.8 Bohr, 3x3x3 k-points, HSE06, 3 Gaussians per shell, screening tolerance 1e-8.
+
+| Step | Before | After | How |
+|---|---|---|---|
+| Exchange build | 42.3 s | 7.1 s | each integral computed once for its eight orderings |
+| Forces and stress of the exchange | 199 s | 12.7 s | four orderings shared; one pass for the six derivative integrals |
+| SCF cycle | 329 s (6 iterations) | 27 s (8 iterations) | the above and incremental builds |
+| Complete calculation | 588 s | 50 s | |
+
+HONPAS on one core of the same machine, same Gaussians, tolerances 1e-10: about 30 s per build; jsiesta on one core
+22 s. Open: an extended pattern for `K`, a distance-dependent bound for the short-range kernel, the cost per
+primitive quartet (about 0.3 microseconds on one core), systems with d shells.
+
+**D-061, pattern range and distance bound (same case, 6x6x6 k-points):** `HFX.PatternScale` 1, 1.5, 2 gives 4704,
+7536, 17452 edges and 49, 80, 177 s for the complete run, for a change of the total energy of 0.03 meV. The bound
+from the distance between the pair densities removes 7 % of the quartets on the standard pattern and 40 % on the
+doubled one (177 -> 105 s). After it, about half (standard) to two thirds (doubled) of the computed quartets are
+still below the tolerance in hindsight: the next gain is a sharper estimate, not a faster integral.
+

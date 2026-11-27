@@ -39,6 +39,8 @@ add_library(jsiesta_ffi SHARED
     src/grid_ffi.cpp
     src/xc_ffi.cpp
     src/kb_three_center.cpp
+    src/eri.cpp
+    src/hfx.cpp
 )
 
 target_include_directories(jsiesta_ffi
@@ -59,10 +61,12 @@ target_compile_options(jsiesta_ffi PRIVATE
 target_link_libraries(jsiesta_ffi PRIVATE Threads::Threads)
 
 if(JSIESTA_USE_LIBXC)
-    find_package(Libxc CONFIG QUIET)
+    # LIBXC_ROOT (variable or environment) takes precedence over a Libxc found elsewhere. Releases 5.1 to 7.x work.
+    find_package(Libxc CONFIG QUIET HINTS "${LIBXC_ROOT}" "$ENV{LIBXC_ROOT}")
     if(Libxc_FOUND)
         target_compile_definitions(jsiesta_ffi PRIVATE JSIESTA_HAS_LIBXC=1)
         target_link_libraries(jsiesta_ffi PRIVATE Libxc::xc)
+        message(STATUS "Linked Libxc ${Libxc_VERSION} from ${Libxc_DIR}")
     else()
         find_path(LIBXC_INCLUDE_DIR
             NAMES xc.h

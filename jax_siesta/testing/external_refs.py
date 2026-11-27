@@ -44,6 +44,7 @@ KNOWN_KEYS: dict[str, str] = {
     "pseudodojo_sr_pbe_dir": "PseudoDojo nc-sr-05 PBE standard PSML set (scalar relativistic; H, C, O, Si, Co, ...)",
     "pseudodojo_fr_pbe_dir": "PseudoDojo nc-fr-04 PBE standard PSML set (fully relativistic; used below nspin 8 and with SOC)",
     "siesta_doc_index": "SQLite documentation index of a SIESTA source tree (docs.db from rebuild_index.py)",
+    "honpas_bin": "HONPAS executable (hybrid-functional reference: HSE06 with NAO2GTO)",
     "siesta_bin_or_cache": "Standard SIESTA executable, or a SIESTA reference cache (JSIESTA_SIESTA_REF_CACHE)",
     "siesta_mgga_bin_or_cache": "pr_mgga SIESTA executable, or a SIESTA reference cache (JSIESTA_SIESTA_REF_CACHE)",
     "siesta_sym_bin_or_cache": "siesta_spglib_full_impl executable, or a SIESTA reference cache (JSIESTA_SIESTA_REF_CACHE)",

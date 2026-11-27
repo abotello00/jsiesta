@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_siesta.core.protocols import SymmetryProjector, bind_symmetry, symmetry_jit_arrays
+from jax_siesta.core.protocols import ExactExchange, SymmetryProjector, bind_symmetry, symmetry_jit_arrays
 from jax_siesta.core.types import (
     BasisData,
     KPointMesh,
@@ -64,7 +64,7 @@ from jax_siesta.scf.descriptors import recommend_scf_defaults
 from jax_siesta.scf.eigensolver import AssemblyPlan, GeneralizedEigenSolver, bloch_assembly_plan
 from jax_siesta.scf.mixer import TikhonovPulayMixer
 from jax_siesta.xc.dispersion import RVV10Dispersion
-from jax_siesta.xc.functional import LibxcFFIEvaluator
+from jax_siesta.xc.functional import LibxcFFIEvaluator, exact_exchange_spec
 
 
 def build_monkhorst_pack_mesh(
@@ -113,16 +113,32 @@ def build_monkhorst_pack_mesh(
 
 
 def _trace_dm_h(dm: jax.Array, h: jax.Array, nspin: int) -> jax.Array:
-    """Spin-resolved ``Tr[D H]`` over the sparse edges (real parts; off-diagonal spin blocks count twice)."""
+    """Spin-resolved ``Re Tr[D^dagger H]`` over the sparse edges (off-diagonal spin blocks count twice)."""
     if nspin in (4, 8):
         return jnp.sum(
             jnp.real(dm[0]) * jnp.real(h[0])
             + jnp.real(dm[1]) * jnp.real(h[1])
+            + jnp.imag(dm[0]) * jnp.imag(h[0])
+            + jnp.imag(dm[1]) * jnp.imag(h[1])
             + 2.0 * (jnp.real(dm[2]) * jnp.real(h[2]) + jnp.real(dm[3]) * jnp.real(h[3]))
         )
     if nspin == 2:
         return jnp.sum(jnp.real(dm) * jnp.real(h))
     return jnp.sum(jnp.real(dm[0]) * jnp.real(h[0]))
+
+
+def _pack_spinor6(m: jax.Array) -> jax.Array:
+    """Real channels ``[Re uu, Re dd, Re ud, Im ud, Im uu, Im dd]`` of a spinor matrix ``(4, n_edges)``."""
+    return jnp.stack(
+        [jnp.real(m[0]), jnp.real(m[1]), jnp.real(m[2]), jnp.real(m[3]), jnp.imag(m[0]), jnp.imag(m[1])], axis=0
+    )
+
+
+def _unpack_spinor6(x: jax.Array) -> jax.Array:
+    """Inverse of ``_pack_spinor6``: complex ``(4, n_edges)`` with real off-diagonal channels."""
+    return jnp.stack(
+        [x[0] + 1j * x[4], x[1] + 1j * x[5], x[2].astype(jnp.complex128), x[3].astype(jnp.complex128)], axis=0
+    )
 
 
 def build_h0_sparse(two_center: TwoCenterMatrices, nspin: int) -> jax.Array:
@@ -437,6 +453,7 @@ def run_scf(
     initial_dm: jax.Array | None = None,
     initial_h: jax.Array | None = None,
     callback: Callable[[dict[str, float]], None] | None = None,
+    exact_exchange: ExactExchange | None = None,
 ) -> tuple[SCFState, tuple[int, int, int]]:
     r"""Execute the adaptive static SCF cycle until convergence or iteration cap.
 
@@ -472,6 +489,10 @@ def run_scf(
         callback: Optional function called once per iteration with a dictionary of floats: ``iteration``
             (from 1), ``free_energy_ha``, ``harris_energy_ha``, ``fermi_level_ha``, ``d_max``, ``h_max_ha`` and
             ``energy_change_ha``. It is for progress reports and convergence histories; it cannot change the run.
+        exact_exchange: Optional exact-exchange stage for a hybrid functional, built for this geometry and
+            pattern. When it is omitted and ``config.xc_functional`` is a hybrid, one is built here
+            (``jax_siesta.hfx.build_exact_exchange``). Its matrix is added to the density-dependent Hamiltonian
+            and its energy to the exchange-correlation energy of every iteration.
 
     Returns:
         Tuple ``(final_scf_state, mesh_shape)``.
@@ -486,6 +507,10 @@ def run_scf(
     n_electrons = basis.total_valence_electrons - config.net_charge
     if n_electrons <= 0.0 or structure.n_atoms == 0:
         raise ValueError("Invalid electron count or empty structure.")
+    if exact_exchange is None and exact_exchange_spec(config.xc_functional).is_hybrid:
+        from jax_siesta.hfx import build_exact_exchange
+
+        exact_exchange = build_exact_exchange(structure, basis, pattern, config, k_grid=kmesh.grid_shape)
 
     if mesh_shape is None:
         mesh_shape = choose_mesh_dimensions(
@@ -522,6 +547,9 @@ def run_scf(
         )
 
     h0 = build_h0_sparse(two_center, config.nspin)
+    if exact_exchange is not None and config.nspin in (4, 8):
+        # The exchange matrix of the diagonal spin blocks is complex, so the Hamiltonian is too.
+        h0 = h0.astype(jnp.complex128)
     n_spin_mat = h0.shape[0]
     n_edges = pattern.n_edges
     packed_basis = _pack_basis_grid_buffers(basis, pattern)
@@ -576,6 +604,21 @@ def run_scf(
     dvol_arr = jnp.asarray(dvol, dtype=jnp.float64)
 
     def _eval_h_grid_and_energy(dm_mat: jax.Array):  # type: ignore[no-untyped-def]
+        h_g, e_h_g, e_xc_g, e_disp_g, e_v_na_g, e_veff_g = _eval_grid_only(dm_mat)
+        if exact_exchange is not None:
+            # Exact exchange of a hybrid: a host kernel outside the compiled step. Its matrix joins the
+            # density-dependent part of H and its energy the exchange-correlation energy, so that the Kohn-Sham and
+            # Harris bookkeeping of _iteration_update holds unchanged (dE_x/dP = H_x, E_x = Tr[P H_x]/2).
+            # For nspin 4 and 8 the exchange matrix of the diagonal spin blocks is complex (K of Im D_uu, Im D_dd).
+            h_x_np, e_x = exact_exchange.matrix_and_energy(np.asarray(dm_mat), config.nspin)
+            h_x = jnp.asarray(h_x_np)
+            if sym_proj is not None:
+                h_x = sym_proj.project_matrix(h_x, config.nspin)
+            h_g = h_g + h_x
+            e_xc_g = e_xc_g + e_x
+        return h_g, e_h_g, e_xc_g, e_disp_g, e_v_na_g, e_veff_g
+
+    def _eval_grid_only(dm_mat: jax.Array):  # type: ignore[no-untyped-def]
         return _grid_hamiltonian_and_energies(
             dm_mat,
             positions_static,
@@ -606,10 +649,12 @@ def run_scf(
         # Warm start from a stored Hamiltonian: it is the first H_in (D_in stays the density paired with it).
         h_in = initial_h.astype(h0.dtype)
 
-    # Note for nspin=8, mixer works on real float64 channels while preserving imag(H_uu, H_dd) from H0_SO
-    h_so_imag = jnp.imag(h0[:2]) if jnp.iscomplexobj(h0) else None
+    # Note for nspin=8, mixer works on real float64 channels while preserving imag(H_uu, H_dd) from H0_SO.
+    # With exact exchange Im(H_uu, H_dd) depends on the density matrix and is mixed as two more real channels.
+    mix_h_imag = exact_exchange is not None and config.nspin in (4, 8)
+    h_so_imag = jnp.imag(h0[:2]) if (jnp.iscomplexobj(h0) and not mix_h_imag) else None
 
-    n_mix_ch = 6 if (config.mix_target == "DM" and config.nspin in (4, 8)) else n_spin_mat
+    n_mix_ch = 6 if (config.nspin in (4, 8) and (config.mix_target == "DM" or mix_h_imag)) else n_spin_mat
     state = SCFState(
         iteration=0,
         h_sparse=h_in,
@@ -701,7 +746,16 @@ def run_scf(
         if converged:
             return state, mesh_shape
 
-        if config.mix_target == "Hamiltonian":
+        if config.mix_target == "Hamiltonian" and mix_h_imag:
+            adiis_aux = (_pack_spinor6(dm_out), free_e_scf) if config.mixer_variant == "adiis" else None
+            x_next6, state = mixer.step(_pack_spinor6(h_cur), _pack_spinor6(h_out), state, mix_config, aux=adiis_aux)
+            h_next = _unpack_spinor6(x_next6)
+            if sym_proj is not None:
+                h_next = sym_proj.project_matrix(h_next, config.nspin)
+            h_cur = h_next
+            dm_in = dm_out
+            e_grid_in = e_h + e_xc + e_disp + e_v_na
+        elif config.mix_target == "Hamiltonian":
             x_in_real = jnp.real(h_cur)
             x_out_real = jnp.real(h_out)
             adiis_aux = (jnp.real(dm_out), free_e_scf) if config.mixer_variant == "adiis" else None
@@ -719,29 +773,8 @@ def run_scf(
         else:
             if config.nspin in (4, 8):
                 # Pack [Re(uu), Re(dd), Re(ud), Im(ud), Im(uu), Im(dd)] so complex DM is mixed consistently
-                def _pack6(m: jax.Array) -> jax.Array:
-                    return jnp.stack(
-                        [
-                            jnp.real(m[0]),
-                            jnp.real(m[1]),
-                            jnp.real(m[2]),
-                            jnp.real(m[3]),
-                            jnp.imag(m[0]),
-                            jnp.imag(m[1]),
-                        ],
-                        axis=0,
-                    )
-
-                x_next6, state = mixer.step(_pack6(dm_in), _pack6(dm_out), state, mix_config)
-                x_next_dm = jnp.stack(
-                    [
-                        x_next6[0] + 1j * x_next6[4],
-                        x_next6[1] + 1j * x_next6[5],
-                        x_next6[2].astype(jnp.complex128),
-                        x_next6[3].astype(jnp.complex128),
-                    ],
-                    axis=0,
-                )
+                x_next6, state = mixer.step(_pack_spinor6(dm_in), _pack_spinor6(dm_out), state, mix_config)
+                x_next_dm = _unpack_spinor6(x_next6)
             else:
                 x_next_dm, state = mixer.step(jnp.real(dm_in), jnp.real(dm_out), state, mix_config)
             if sym_proj is not None:

@@ -16,7 +16,12 @@ Troubleshooting
 
 ``Unsupported XC functional``
    Names accepted: ``LDA``/``CA``/``PZ``, ``PW92``, ``PBE``, ``PBEsol``, ``R2SCAN``, ``SCAN``, ``TPSS``, or
-   ``LIBXC-<x>+<c>``. Meta-GGAs need a build with Libxc.
+   ``LIBXC-<x>+<c>``; hybrids ``HSE06``, ``PBE0``, ``B3LYP``. Meta-GGAs and hybrids need a build with Libxc.
+
+``... has full-range exact exchange. Its lattice sum needs a k-point mesh with at least ...``
+   ``PBE0`` and ``B3LYP`` in a periodic system need a k-point mesh whose supercell is larger than the range of
+   the orbital pairs; the message gives the smallest divisions. For a molecule, enlarge the cell until no
+   orbital reaches a periodic image. Otherwise use the screened hybrid ``HSE06``.
 
 The SCF does not converge
    Look at the SCF table. For metals and magnetic systems raise ``ElectronicTemperature`` (for example 25 meV),

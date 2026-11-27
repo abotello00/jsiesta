@@ -25,6 +25,8 @@ Matter **14**, 2745 (2002).
      - Symmetry projection of matrices and mesh functions, the SCF cycle and its mixing
    * - :doc:`../_generated/theory_variational_forces_stress`
      - Forces and stress as derivatives of the energy at fixed density and energy-density matrices
+   * - :doc:`../_generated/theory_hybrid_functionals`
+     - Hybrid functionals: the exact-exchange matrix, Gaussian fits of the orbitals, the four-centre integrals
 
 .. toctree::
    :hidden:
@@ -34,3 +36,4 @@ Matter **14**, 2745 (2002).
    ../_generated/theory_naos_and_psml
    ../_generated/theory_symmetry_and_scf
    ../_generated/theory_variational_forces_stress
+   ../_generated/theory_hybrid_functionals

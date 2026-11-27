@@ -417,6 +417,9 @@ class SCFConfig:
         - ``electronic_temp_ha >= 0.0``.
         - ``mix_target in ("Hamiltonian", "DM")``.
         - ``mesh_criterion in ("jsiesta", "siesta")``; ``mesh_subdivisions >= 1`` (SIESTA ``MeshSubDivisions``).
+        - ``hfx_n_gauss`` (Gaussians per orbital shell) and ``hfx_screen_tol`` (screening of the four-centre
+          integrals, Hartree) are used only when ``xc_functional`` is a hybrid. ``hfx_pattern_scale >= 1`` extends
+          the sparse pattern to orbital pairs within that multiple of the sum of their radii.
         - ``mixer_variant in ("tikhonov", "pulay", "broyden", "adiis")``; ``"adiis"`` requires
           ``mix_target == "Hamiltonian"``. (Until D-022 ``"adiis"``/``"broyden"`` were Pulay with a different diagonal
           shift and raised ``NotImplementedError``.)
@@ -450,6 +453,9 @@ class SCFConfig:
     symprec: float = 1e-5
     mag_symprec: float = 1e-3
     net_charge: float = 0.0
+    hfx_n_gauss: int = 5
+    hfx_screen_tol: float = 1e-7
+    hfx_pattern_scale: float = 1.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -563,6 +569,10 @@ class Observables:
         - ``outcome`` belongs to the five-state taxonomy:
           ``converged``, ``iteration_cap_exhausted``, ``numerical_breakdown``,
           ``invalid_input``, ``normal_state_collapse``.
+        - ``e_exact_exchange_ha`` is the exact-exchange energy of a hybrid functional (zero otherwise); it is part
+          of ``total_energy_ha`` and not of ``e_xc_ha``, which holds the semilocal remainder.
+        - ``forces_available`` is false when forces and stress were not computed
+          (``compute_forces_stress=False``); the arrays are then zero.
 
     SIESTA Mapping:
         Consolidates ``m_energies``, ``post_scf_work``, ``compute_energies``,
@@ -597,6 +607,8 @@ class Observables:
     magnetic_subgroup: str = "P1"
     xc_backend: str = "builtin_cpp"
     harris_provenance: str = "not_computed"
+    e_exact_exchange_ha: float = 0.0
+    forces_available: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
 
     _pytree_children = (

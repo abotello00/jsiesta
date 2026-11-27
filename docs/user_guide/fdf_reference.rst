@@ -88,8 +88,23 @@ Hamiltonian
    * - ``XC.Functional`` / ``XC.Authors``
      - ``LDA`` / ``CA``
      - ``LDA``: ``CA`` (= ``PZ``), ``PW92``. ``GGA``: ``PBE``, ``PBEsol``. Also accepted as ``XC.Authors``:
-       ``R2SCAN``, ``SCAN``, ``TPSS``, and ``LIBXC-<x>+<c>`` with Libxc numbers. Hybrid functionals are not
-       supported.
+       ``R2SCAN``, ``SCAN``, ``TPSS``, and ``LIBXC-<x>+<c>`` with Libxc numbers. Hybrid functionals:
+       ``XC.Authors HSE06``, ``PBE0``, ``B3LYP``, or a Libxc hybrid id. ``PBE0`` and ``B3LYP`` (full-range
+       exchange) need, in a crystal, a k-point mesh at least as fine as the range of the orbitals (the error
+       message gives the divisions) and an insulator. Hybrids work for every ``Spin`` mode (energies,
+       eigenvalues, forces and stress) and are much slower than a GGA.
+   * - ``HFX.NumberOfGaussians``
+     - 5
+     - jsiesta only. Gaussians fitted to each orbital shell for the exact exchange of a hybrid functional.
+   * - ``HFX.ScreeningTolerance``
+     - 1e-7
+     - jsiesta only. Four-centre integrals whose bound times the density matrix is below this (Hartree) are
+       skipped.
+   * - ``HFX.PatternScale``
+     - 1
+     - jsiesta only. The density matrix and the exchange matrix are kept for orbital pairs within this multiple
+       of the sum of their radii (1: pairs that overlap, as in HONPAS). Larger values reduce the truncation
+       error of the exact exchange at a higher cost; semilocal terms are not affected.
    * - ``Spin``
      - ``none``
      - ``none``, ``polarized``, ``non-collinear``, ``spin-orbit``. The older ``SpinPolarized``,

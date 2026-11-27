@@ -1,7 +1,7 @@
 # jsiesta quality gates. `make check` is the CI entry point (docs/design/IMPLEMENTATION_PLAN.md §5.3, §5.4).
 #
 #   make venv      create .venv with pinned dependencies (uv)
-#   make ffi       build cpp/build/libjsiesta_ffi (libxc from /opt/etsf or LIBXC_ROOT)
+#   make ffi       build cpp/build/libjsiesta_ffi (Libxc 5.1 to 7.x from LIBXC_ROOT, else /opt/etsf)
 #   make lint      ruff
 #   make typecheck mypy on jax_siesta/ and kg/
 #   make docs      doxygen + sphinx -W (warnings are errors)
